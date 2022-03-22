@@ -1,0 +1,17 @@
+[package]
+edition = "2021"
+name = "puzzle-image-gen"
+version = "0.1.0"
+[dependencies]
+image = "0.24.1"
+nalgebra = "0.30.1"
+ndarray = "0.15.4"
+splines = "4.0.3"
+
+[dependencies.clap]
+features = ["derive"]
+version = "3.1.6"
+
+[dependencies.imageproc]
+git = "https://github.com/image-rs/imageproc"
+rev = "b7942657b1a370fc485507693ed4df1f8a116cb7"
