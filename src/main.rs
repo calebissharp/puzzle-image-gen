@@ -1,269 +1,318 @@
-mod piece;
-mod polygon;
-mod spline;
-use crate::spline::CatmullRomSpline;
+use image::{open, RgbaImage};
+use std::{borrow::Cow, num::NonZeroU32, path::Path, str::FromStr};
 
-use clap::Parser;
-use humantime::format_duration;
-use image::error::{DecodingError, ImageError};
-use image::imageops::{resize, FilterType};
-use image::io::Reader as ImageReader;
-use image::{
-    DynamicImage, GenericImage, GenericImageView, ImageBuffer, Pixel, RgbImage, Rgba, RgbaImage,
-};
-use imageproc::drawing::{
-    draw_antialiased_line_segment_mut, draw_cross_mut, draw_line_segment_mut, Blend,
-};
-use imageproc::pixelops::interpolate;
-use nalgebra::{
-    DMatrix, DVector, Matrix4, Matrix4x2, RowDVector, RowVector2, RowVector4, Vector2, Vector4,
-};
-use piece::MAX_JOINER_SIZE;
-use rayon::prelude::*;
-use std::vec::Vec;
+// Indicates a u32 overflow in an intermediate Collatz value
+const OVERFLOW: u32 = 0xffffffff;
 
-/// Simple program to greet a person
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
-    /// Path to source image
-    #[clap(short, long)]
-    path: String,
-    /// Output directory to store generated piece images
-    #[clap(short, long)]
-    output: String,
-    /// Target size for the longest side
-    #[clap(long, default_value_t = 4096)]
-    target_resolution: u32,
+async fn run() {
+    let numbers = if std::env::args().len() <= 1 {
+        let default = vec![1, 2, 3, 4];
+        println!("No numbers were provided, defaulting to {:?}", default);
+        default
+    } else {
+        std::env::args()
+            .skip(1)
+            .map(|s| u32::from_str(&s).expect("You must pass a list of positive integers!"))
+            .collect()
+    };
+
+    let steps = execute_gpu(&numbers).await.unwrap();
+
+    let disp_steps: Vec<String> = steps
+        .iter()
+        .map(|&n| match n {
+            OVERFLOW => "OVERFLOW".to_string(),
+            _ => n.to_string(),
+        })
+        .collect();
+
+    // println!("Steps: [{}]", disp_steps.join(", "));
+    #[cfg(target_arch = "wasm32")]
+    log::info!("Steps: [{}]", disp_steps.join(", "));
 }
 
-fn slice_image(
-    img: &RgbaImage,
-    pieces_x: u32,
-    pieces_y: u32,
-    padding: u32,
-) -> Result<Vec<RgbaImage>, ImageError> {
-    let padded_img = add_padding_to_img(img, padding)?;
+async fn execute_gpu(numbers: &[u32]) -> Option<Vec<u32>> {
+    // Instantiates instance of WebGPU
+    let instance = wgpu::Instance::new(wgpu::Backends::all());
 
-    let piece_height = img.height() / pieces_y;
-    let piece_width = img.width() / pieces_x;
+    let img = open("./test-images/uv.jpg").unwrap().to_rgba8();
 
-    let mut new_images = vec![
-        RgbaImage::new(piece_width, piece_height);
-        usize::try_from(pieces_x * pieces_y).unwrap()
-    ];
+    // `request_adapter` instantiates the general connection to the GPU
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await?;
 
-    for y in 0..pieces_y {
-        for x in 0..pieces_x {
-            let i = usize::try_from(y * pieces_x + x).unwrap();
+    // `request_device` instantiates the feature specific connection to the GPU, defining some parameters,
+    //  `features` being the available features.
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: None,
+                features: wgpu::Features::empty(),
+                limits: wgpu::Limits::downlevel_defaults(),
+            },
+            Some(Path::new("./tracing")),
+        )
+        .await
+        .unwrap();
 
-            new_images[i] = padded_img
-                .view(
-                    x * piece_width,
-                    y * piece_height,
-                    piece_width + padding * 2,
-                    piece_height + padding * 2,
-                )
-                .to_image();
-        }
-    }
+    let info = adapter.get_info();
 
-    Ok(new_images)
+    execute_gpu_inner(&device, &queue, numbers, img).await
 }
 
-fn add_padding_to_img(img: &RgbaImage, padding: u32) -> Result<RgbaImage, ImageError> {
-    let mut new_img = RgbaImage::new(img.width() + padding * 2, img.height() + padding * 2);
-
-    new_img.copy_from(img, padding, padding)?;
-
-    Ok(new_img)
-}
-
-// fn draw_grid(img: &mut RgbaImage) -> Result<(), ImageError> {
-//     // img.put_pixel(x: u32, y: u32, pixel: P)
-//     // let control_points = vec![
-//     //     Key::new(0., [0., 0.], Interpolation::CatmullRom),
-//     //     Key::new(5., [5., 5.], Interpolation::CatmullRom),
-//     //     Key::new(10., [0., 0.], Interpolation::CatmullRom),
-//     // ];
-//     // let spline = Spline::from_vec(control_points);
-
-//     // for i in 0..10 {
-//     //     println!("{:?}", spline.sample(0.));
-//     // }
-
-//     let red = Rgba([255u8, 0, 0, 255u8]);
-
-//     // draw_line_segment_mut(img, (5., 5.), (500., 500.), red);
-//     draw_antialiased_line_segment_mut(img, (5, 5), (500, 500), red, |left, right, weight| {
-//         interpolate(left, right, 1.1)
-//     });
-
-//     Ok(())
-// }
-
-fn main() -> std::io::Result<()> {
-    let args = Args::parse();
-
-    let mut img = ImageReader::open(&args.path)?
-        .decode()
-        .unwrap()
-        .into_rgba8();
-
-    println!(
-        "Loaded image {}, ({}x{})",
-        args.path,
-        img.width(),
-        img.height(),
-    );
-
-    let src_width = img.width();
-    let src_height = img.height();
-
-    let scale = args.target_resolution / std::cmp::max(src_width, src_height);
-
-    let target_width = scale * src_width;
-    let target_height = scale * src_height;
-
-    println!("Resizing image to {}x{}", target_width, target_height);
-
-    img = resize(&img, target_width, target_height, FilterType::CatmullRom);
-
-    let padding = MAX_JOINER_SIZE;
-
-    let pieces_x = 16;
-    let pieces_y = 16;
-
-    let mut pieces = slice_image(&img, pieces_x, pieces_y, padding).unwrap();
-
-    let white = Rgba([255, 255, 255, 255]);
-    let red = Rgba([255, 0, 0, 255]);
-    let green = Rgba([0, 255, 0, 255]);
-    let blue = Rgba([0, 0, 255, 255]);
-
-    let piece_width = target_width / pieces_x;
-    let piece_height = target_height / pieces_y;
-
-    let top_points = piece::Edge::gen_edge(piece::Side::TOP, piece_width);
-    let mut right_points = piece::Edge::gen_edge(piece::Side::RIGHT, piece_height);
-    let mut bottom_points = piece::Edge::gen_edge(piece::Side::BOTTOM, piece_width);
-    let mut left_points = piece::Edge::gen_edge(piece::Side::LEFT, piece_height);
-
-    let mut control_points = top_points.points;
-    control_points.append(&mut right_points.points);
-    control_points.append(&mut bottom_points.points);
-    control_points.append(&mut left_points.points);
-    // control_points.push(control_points[0]);
-
-    let spline = CatmullRomSpline::new(control_points.clone(), 0.5, true);
-
-    let step = 10;
-
-    let mut points = (0..(spline.control_points.len() - 1) * step)
-        .map(|x| spline.sample(x as f64 / step as f64).unwrap().transpose())
-        .collect::<Vec<Vector2<f64>>>();
-
-    points.push(points[0]);
-
-    let polygon = polygon::Polygon::new(points.clone());
-
-    // img.save("test-image.png").unwrap();
-
-    println!("Split into {} images", pieces.len());
-
-    let mut points_iter = points.windows(2);
-
-    let mut border_img = RgbaImage::new(288, 288);
-
-    // while let Some(points) = points_iter.next() {
-    //     let point = points[0];
-    //     let next_point = points[1];
-    //     // let mut color = white.clone();
-    //     // color[3] = (point[0].fract() * 255.).round() as u8;
-
-    //     // img.put_pixel(point[0].round() as u32, point[1].round() as u32, white);
-    //     draw_antialiased_line_segment_mut(
-    //         &mut pieces[18],
-    //         (point[0].round() as i32, point[1].round() as i32),
-    //         (next_point[0].round() as i32, next_point[1].round() as i32),
-    //         white,
-    //         interpolate,
-    //     )
-    // }
-
-    let start = std::time::Instant::now();
-
-    pieces.par_iter_mut().for_each(|piece| {
-        piece.enumerate_pixels_mut().for_each(|(x, y, pixel)| {
-            if !polygon.check(x as f64, y as f64) {
-                pixel[3] = 0;
-            }
-        });
-        // for (x, y, pixel) in piece.enumerate_pixels_mut() {
-        //     if !polygon.check(x as f64, y as f64) {
-        //         pixel[3] = 0;
-        //     }
-        // }
+async fn execute_gpu_inner(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    numbers: &[u32],
+    image: RgbaImage,
+) -> Option<Vec<u32>> {
+    // Loads the shader from WGSL
+    let cs_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("cookie-cutter.wgsl"))),
     });
 
-    let elapsed = start.elapsed();
+    let dimensions = image.dimensions();
 
-    println!("Finished masking pieces (took {}ms)", elapsed.as_millis());
+    let texture_size = wgpu::Extent3d {
+        width: dimensions.0,
+        height: dimensions.1,
+        depth_or_array_layers: 1,
+    };
 
-    // for (x, y, pixel) in pieces[18].enumerate_pixels_mut() {
-    //     // let border_pixel = border_img.get_pixel(x, y);
-    //     // if border_pixel[3] > 0 {
-    //     //todo: antialias?
-    //     // pixel[3] = border_pixel[3];
-    //     if !polygon.check(x as f64, y as f64) {
-    //         pixel[3] = 0;
-    //     }
+    let src_texture = device.create_texture(&wgpu::TextureDescriptor {
+        size: texture_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_DST,
+        label: Some("piece-texture"),
+    });
+    let src_texture_view = src_texture.create_view(&Default::default());
+    let src_texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: texture_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING,
+    });
+    let output_texture_view = output_texture.create_view(&Default::default());
+
+    let texture_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(
+                        // SamplerBindingType::Comparison is only for TextureSampleType::Depth
+                        // SamplerBindingType::Filtering if the sample_type of the texture is:
+                        //     TextureSampleType::Float { filterable: true }
+                        // Otherwise you'll get an error.
+                        wgpu::SamplerBindingType::Filtering,
+                    ),
+                    count: None,
+                },
+            ],
+            label: Some("texture_bind_group_layout"),
+        });
+
+    let output_texture_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            }],
+            label: Some("texture_bind_group_layout"),
+        });
+
+    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        mapped_at_creation: false,
+        size: (dimensions.0 * dimensions.1 * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+    });
+
+    // A pipeline specifies the operation of a shader
+
+    // Instantiates the pipeline.
+    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &cs_module,
+        entry_point: "main",
+    });
+
+    // Instantiates the bind group, once again specifying the binding of buffers.
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("src bind group"),
+        layout: &texture_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&src_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&src_texture_sampler),
+            },
+        ],
+    });
+
+    println!(
+        "Max bind groups: {}, maxStorageBuffersPerShaderStage: {}",
+        device.limits().max_bind_groups,
+        device.limits().max_storage_buffers_per_shader_stage
+    );
+
+    let output_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("output bind group"),
+        layout: &output_texture_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&output_texture_view),
+        }],
+    });
+
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &src_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &image,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: std::num::NonZeroU32::new(4 * dimensions.0),
+            rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+        },
+        texture_size,
+    );
+
+    // A command encoder executes one or many pipelines.
+    // It is to WebGPU what a command buffer is to Vulkan.
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        cpass.set_pipeline(&compute_pipeline);
+        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.set_bind_group(1, &output_bind_group, &[]);
+        cpass.dispatch(dimensions.0, dimensions.1, 1);
+        // cpass.dispatch(img_slice.len() as u32, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
+    }
+    // Sets adds copy operation to command encoder.
+    // Will copy data from storage buffer on GPU to staging buffer on CPU.
+
+    encoder.copy_texture_to_buffer(
+        // wgpu::ImageCopyTexture {
+        //     texture: &output_texture,
+        //     mip_level: 0,
+        //     origin: wgpu::Origin3d::ZERO,
+        //     aspect: wgpu::TextureAspect::All,
+        // },
+        output_texture.as_image_copy(),
+        wgpu::ImageCopyBuffer {
+            buffer: &staging_buffer,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: std::num::NonZeroU32::new(4 * dimensions.0),
+                rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+            },
+        },
+        texture_size,
+    );
+
+    // Submits command encoder for processing
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging_buffer.slice(..);
+    let buffer_future = slice.map_async(wgpu::MapMode::Read);
+
+    // Poll the device in a blocking manner so that our future resolves.
+    // In an actual application, `device.poll(...)` should
+    // be called in an event loop or on another thread.
+    device.poll(wgpu::Maintain::Wait);
+
+    if let Ok(()) = buffer_future.await {
+        let data = slice.get_mapped_range();
+        let result: Vec<u8> = bytemuck::cast_slice(&data).to_vec();
+
+        // assert_eq!(&result, image.as_raw());
+
+        let new_image = image::RgbaImage::from_raw(dimensions.0, dimensions.1, result).unwrap();
+
+        new_image.save("test2.png");
+    } else {
+        panic!("AHHH")
+    }
+
+    // if let Ok(()) = thing_future.await {
+    //     let data = thing.get_mapped_range();
+    //     let result = bytemuck::cast_slice(&data).to_vec();
+
+    //     drop(data);
+    //     img_dest_buffer.unmap();
+
+    //     // println!("{:?}", result);
+    //     // assert_eq!(&result, img_slice);
+    //     println!("{:?} {:?}", img_slice[0], result[0]);
+
+    //     Some(result)
+    // } else {
+    //     panic!("Failed to run compute on gpu")
     // }
 
-    while let Some(points) = points_iter.next() {
-        let point = points[0];
-        let next_point = points[1];
-        // let mut color = white.clone();
-        // color[3] = (point[0].fract() * 255.).round() as u8;
+    Some(vec![2])
+}
 
-        // img.put_pixel(point[0].round() as u32, point[1].round() as u32, white);
-        // draw_antialiased_line_segment_mut(
-        //     &mut pieces[18],
-        //     (point[0].round() as i32, point[1].round() as i32),
-        //     (next_point[0].round() as i32, next_point[1].round() as i32),
-        //     white,
-        //     interpolate,
-        // )
-        // draw_line_segment_mut(
-        //     &mut pieces[18],
-        //     (point[0] as f32, point[1] as f32),
-        //     (next_point[0] as f32, next_point[1] as f32),
-        //     white,
-        // )
+fn main() {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        env_logger::init();
+        pollster::block_on(run());
     }
-
-    for (i, control_point) in control_points.iter().enumerate() {
-        assert_eq!(spline.sample(i as f64).unwrap().as_slice(), control_point);
-
-        draw_cross_mut(
-            &mut pieces[18],
-            green,
-            control_point[0].round() as i32,
-            control_point[1].round() as i32,
-        );
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+        console_log::init().expect("could not initialize logger");
+        wasm_bindgen_futures::spawn_local(run());
     }
-
-    println!("Writing images to files");
-
-    // let piece_path = format!("{}/piece{}.png", args.output, 0);
-    // pieces[18].save(piece_path).unwrap();
-
-    for (i, piece) in pieces.iter().enumerate() {
-        let piece_path = format!("{}/piece{}.png", args.output, i);
-        piece.save(piece_path).unwrap();
-    }
-
-    println!("Done!");
-
-    Ok(())
 }
