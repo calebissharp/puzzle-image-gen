@@ -1,41 +1,20 @@
+use image::GenericImage;
 use image::{open, RgbaImage};
-use std::{borrow::Cow, num::NonZeroU32, path::Path, str::FromStr};
+use std::borrow::Cow;
 
-// Indicates a u32 overflow in an intermediate Collatz value
-const OVERFLOW: u32 = 0xffffffff;
-
-async fn run() {
-    let numbers = if std::env::args().len() <= 1 {
-        let default = vec![1, 2, 3, 4];
-        println!("No numbers were provided, defaulting to {:?}", default);
-        default
-    } else {
-        std::env::args()
-            .skip(1)
-            .map(|s| u32::from_str(&s).expect("You must pass a list of positive integers!"))
-            .collect()
-    };
-
-    let steps = execute_gpu(&numbers).await.unwrap();
-
-    let disp_steps: Vec<String> = steps
-        .iter()
-        .map(|&n| match n {
-            OVERFLOW => "OVERFLOW".to_string(),
-            _ => n.to_string(),
-        })
-        .collect();
-
-    // println!("Steps: [{}]", disp_steps.join(", "));
-    #[cfg(target_arch = "wasm32")]
-    log::info!("Steps: [{}]", disp_steps.join(", "));
+fn find_closest_multiple(n: u32, x: u32) -> u32 {
+    ((n - 1) | (x - 1)) + 1
 }
 
-async fn execute_gpu(numbers: &[u32]) -> Option<Vec<u32>> {
+async fn run() {
+    execute_gpu().await;
+}
+
+async fn execute_gpu() -> Option<()> {
     // Instantiates instance of WebGPU
     let instance = wgpu::Instance::new(wgpu::Backends::all());
 
-    let img = open("./test-images/uv.jpg").unwrap().to_rgba8();
+    let img = open("./test-images/chungus.jpg").unwrap().to_rgba8();
 
     // `request_adapter` instantiates the general connection to the GPU
     let adapter = instance
@@ -49,24 +28,37 @@ async fn execute_gpu(numbers: &[u32]) -> Option<Vec<u32>> {
             &wgpu::DeviceDescriptor {
                 label: None,
                 features: wgpu::Features::empty(),
-                limits: wgpu::Limits::downlevel_defaults(),
+                limits: wgpu::Limits::default(),
             },
-            Some(Path::new("./tracing")),
+            None,
         )
         .await
         .unwrap();
 
-    let info = adapter.get_info();
+    execute_gpu_inner(&device, &queue, img).await;
 
-    execute_gpu_inner(&device, &queue, numbers, img).await
+    Some(())
 }
 
 async fn execute_gpu_inner(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    numbers: &[u32],
-    image: RgbaImage,
-) -> Option<Vec<u32>> {
+    src_img: RgbaImage,
+) -> Option<()> {
+    let original_image_dimensions = src_img.dimensions();
+    let mut image = RgbaImage::new(
+        find_closest_multiple(src_img.width(), 256),
+        src_img.height(),
+    );
+    println!(
+        "Original: ({}x{}), New: ({}x{})",
+        src_img.width(),
+        src_img.height(),
+        image.width(),
+        image.height(),
+    );
+    image.copy_from(&src_img, 0, 0).unwrap();
+
     // Loads the shader from WGSL
     let cs_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
         label: None,
@@ -75,18 +67,23 @@ async fn execute_gpu_inner(
 
     let dimensions = image.dimensions();
 
-    let texture_size = wgpu::Extent3d {
+    println!(
+        "Max texture size: {}",
+        device.limits().max_texture_dimension_2d
+    );
+
+    let texture_extent = wgpu::Extent3d {
         width: dimensions.0,
         height: dimensions.1,
         depth_or_array_layers: 1,
     };
 
     let src_texture = device.create_texture(&wgpu::TextureDescriptor {
-        size: texture_size,
+        size: texture_extent,
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -106,7 +103,7 @@ async fn execute_gpu_inner(
 
     let output_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: texture_size,
+        size: texture_extent,
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -134,31 +131,20 @@ async fn execute_gpu_inner(
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Sampler(
-                        // SamplerBindingType::Comparison is only for TextureSampleType::Depth
-                        // SamplerBindingType::Filtering if the sample_type of the texture is:
-                        //     TextureSampleType::Float { filterable: true }
-                        // Otherwise you'll get an error.
-                        wgpu::SamplerBindingType::Filtering,
-                    ),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
                     count: None,
                 },
             ],
-            label: Some("texture_bind_group_layout"),
-        });
-
-    let output_texture_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            }],
             label: Some("texture_bind_group_layout"),
         });
 
@@ -171,10 +157,16 @@ async fn execute_gpu_inner(
 
     // A pipeline specifies the operation of a shader
 
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[&texture_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
     // Instantiates the pipeline.
     let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
-        layout: None,
+        layout: Some(&pipeline_layout),
         module: &cs_module,
         entry_point: "main",
     });
@@ -192,23 +184,14 @@ async fn execute_gpu_inner(
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(&src_texture_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&output_texture_view),
+            },
         ],
     });
 
-    println!(
-        "Max bind groups: {}, maxStorageBuffersPerShaderStage: {}",
-        device.limits().max_bind_groups,
-        device.limits().max_storage_buffers_per_shader_stage
-    );
-
-    let output_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("output bind group"),
-        layout: &output_texture_bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::TextureView(&output_texture_view),
-        }],
-    });
+    println!("bytes_per_row: {}", dimensions.0);
 
     queue.write_texture(
         wgpu::ImageCopyTexture {
@@ -223,7 +206,7 @@ async fn execute_gpu_inner(
             bytes_per_row: std::num::NonZeroU32::new(4 * dimensions.0),
             rows_per_image: std::num::NonZeroU32::new(dimensions.1),
         },
-        texture_size,
+        texture_extent,
     );
 
     // A command encoder executes one or many pipelines.
@@ -234,20 +217,11 @@ async fn execute_gpu_inner(
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_pipeline(&compute_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.set_bind_group(1, &output_bind_group, &[]);
         cpass.dispatch(dimensions.0, dimensions.1, 1);
-        // cpass.dispatch(img_slice.len() as u32, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
     }
     // Sets adds copy operation to command encoder.
     // Will copy data from storage buffer on GPU to staging buffer on CPU.
-
     encoder.copy_texture_to_buffer(
-        // wgpu::ImageCopyTexture {
-        //     texture: &output_texture,
-        //     mip_level: 0,
-        //     origin: wgpu::Origin3d::ZERO,
-        //     aspect: wgpu::TextureAspect::All,
-        // },
         output_texture.as_image_copy(),
         wgpu::ImageCopyBuffer {
             buffer: &staging_buffer,
@@ -257,7 +231,7 @@ async fn execute_gpu_inner(
                 rows_per_image: std::num::NonZeroU32::new(dimensions.1),
             },
         },
-        texture_size,
+        texture_extent,
     );
 
     // Submits command encoder for processing
@@ -277,30 +251,24 @@ async fn execute_gpu_inner(
 
         // assert_eq!(&result, image.as_raw());
 
-        let new_image = image::RgbaImage::from_raw(dimensions.0, dimensions.1, result).unwrap();
+        let mut new_image = image::RgbaImage::from_raw(dimensions.0, dimensions.1, result).unwrap();
 
-        new_image.save("test2.png");
+        let cropped_image = image::imageops::crop(
+            &mut new_image,
+            0,
+            0,
+            original_image_dimensions.0,
+            original_image_dimensions.1,
+        )
+        .to_image();
+
+        println!("Saving image...");
+        cropped_image.save("test-image.png").unwrap();
     } else {
         panic!("AHHH")
     }
 
-    // if let Ok(()) = thing_future.await {
-    //     let data = thing.get_mapped_range();
-    //     let result = bytemuck::cast_slice(&data).to_vec();
-
-    //     drop(data);
-    //     img_dest_buffer.unmap();
-
-    //     // println!("{:?}", result);
-    //     // assert_eq!(&result, img_slice);
-    //     println!("{:?} {:?}", img_slice[0], result[0]);
-
-    //     Some(result)
-    // } else {
-    //     panic!("Failed to run compute on gpu")
-    // }
-
-    Some(vec![2])
+    Some(())
 }
 
 fn main() {
