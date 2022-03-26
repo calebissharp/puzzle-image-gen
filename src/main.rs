@@ -1,5 +1,8 @@
+mod piece;
+mod spline;
 use image::GenericImage;
 use image::{open, RgbaImage};
+use spline::CatmullRomSpline;
 use std::borrow::Cow;
 
 fn find_closest_multiple(n: u32, x: u32) -> u32 {
@@ -14,7 +17,7 @@ async fn execute_gpu() -> Option<()> {
     // Instantiates instance of WebGPU
     let instance = wgpu::Instance::new(wgpu::Backends::all());
 
-    let img = open("./test-images/chungus.jpg").unwrap().to_rgba8();
+    let img = open("./test-images/uv.jpg").unwrap().to_rgba8();
 
     // `request_adapter` instantiates the general connection to the GPU
     let adapter = instance
@@ -46,12 +49,14 @@ async fn execute_gpu_inner(
     src_img: RgbaImage,
 ) -> Option<()> {
     let original_image_dimensions = src_img.dimensions();
+    // Image width needs to be a multiple of 256 in order
+    // for copy_texture_to_buffer to work
     let mut image = RgbaImage::new(
         find_closest_multiple(src_img.width(), 256),
         src_img.height(),
     );
     println!(
-        "Original: ({}x{}), New: ({}x{})",
+        "Padding image for GPU\nOriginal: ({}x{}), New: ({}x{})",
         src_img.width(),
         src_img.height(),
         image.width(),
@@ -59,23 +64,46 @@ async fn execute_gpu_inner(
     );
     image.copy_from(&src_img, 0, 0).unwrap();
 
+    let dimensions = image.dimensions();
+
+    let pieces_x = 16;
+    let pieces_y = 16;
+    let num_pieces = pieces_x * pieces_y;
+    let piece_padding = 16;
+
+    let piece_width = dimensions.0 / pieces_x + piece_padding * 2;
+    let piece_height = dimensions.1 / pieces_y + piece_padding * 2;
+
+    let output_buffer_row_size = find_closest_multiple(piece_width * 4, 256);
+
+    println!(
+        "PIECE_WIDTH: {}, PIECE_HEIGHT: {}, NUM_PIECES_X: {}, NUM_PIECES_Y: {}",
+        piece_width, piece_height, pieces_x, pieces_y,
+    );
+
     // Loads the shader from WGSL
     let cs_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
         label: None,
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("cookie-cutter.wgsl"))),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
+            &include_str!("cookie-cutter.wgsl")
+                .replace("$PIECE_WIDTH$", &piece_width.to_string())
+                .replace("$PIECE_HEIGHT$", &piece_height.to_string())
+                .replace("$NUM_PIECES_X$", &pieces_x.to_string())
+                .replace("$NUM_PIECES_Y$", &pieces_y.to_string())
+                .replace("$NUM_PIECES$", &num_pieces.to_string()),
+        )),
     });
-
-    let dimensions = image.dimensions();
-
-    println!(
-        "Max texture size: {}",
-        device.limits().max_texture_dimension_2d
-    );
 
     let texture_extent = wgpu::Extent3d {
         width: dimensions.0,
         height: dimensions.1,
         depth_or_array_layers: 1,
+    };
+
+    let output_texture_extent = wgpu::Extent3d {
+        width: piece_width,
+        height: piece_height,
+        depth_or_array_layers: num_pieces,
     };
 
     let src_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -103,10 +131,10 @@ async fn execute_gpu_inner(
 
     let output_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: texture_extent,
+        size: output_texture_extent,
         mip_level_count: 1,
         sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
+        dimension: wgpu::TextureDimension::D3,
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::COPY_DST
@@ -114,6 +142,44 @@ async fn execute_gpu_inner(
             | wgpu::TextureUsages::STORAGE_BINDING,
     });
     let output_texture_view = output_texture.create_view(&Default::default());
+
+    let piece_width = 168;
+    let piece_height = 168;
+
+    let top_points = piece::Edge::gen_edge(piece::Side::TOP, piece_width);
+    let mut right_points = piece::Edge::gen_edge(piece::Side::RIGHT, piece_height);
+    let mut bottom_points = piece::Edge::gen_edge(piece::Side::BOTTOM, piece_width);
+    let mut left_points = piece::Edge::gen_edge(piece::Side::LEFT, piece_height);
+
+    println!("Generating control points...");
+    let mut control_points = top_points.points;
+    control_points.append(&mut right_points.points);
+    control_points.append(&mut bottom_points.points);
+    control_points.append(&mut left_points.points);
+    // control_points.push(control_points[0]);
+
+    let spline = CatmullRomSpline::new(control_points.clone(), 0.5, true);
+
+    let step = 10;
+
+    let mut points = (0..(spline.control_points.len() - 1) * step)
+        .map(|x| spline.sample(x as f64 / step as f64).unwrap().transpose())
+        .flat_map(|points| [points[0] as f32, points[1] as f32])
+        .collect::<Vec<f32>>();
+
+    points.push(points[0]);
+    points.push(points[1]);
+
+    println!("Generated {} control points!", points.len());
+
+    let points_buffer_size = (points.len() * std::mem::size_of::<f32>()) as u64;
+
+    let curve_points_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        mapped_at_creation: false,
+        size: points_buffer_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
 
     let texture_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -140,7 +206,17 @@ async fn execute_gpu_inner(
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(points_buffer_size),
                     },
                     count: None,
                 },
@@ -151,7 +227,7 @@ async fn execute_gpu_inner(
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         mapped_at_creation: false,
-        size: (dimensions.0 * dimensions.1 * 4) as u64,
+        size: (output_buffer_row_size * piece_height * num_pieces) as u64,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
     });
 
@@ -188,6 +264,10 @@ async fn execute_gpu_inner(
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(&output_texture_view),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: curve_points_buffer.as_entire_binding(),
+            },
         ],
     });
 
@@ -209,6 +289,8 @@ async fn execute_gpu_inner(
         texture_extent,
     );
 
+    queue.write_buffer(&curve_points_buffer, 0, bytemuck::cast_slice(&points));
+
     // A command encoder executes one or many pipelines.
     // It is to WebGPU what a command buffer is to Vulkan.
     let mut encoder =
@@ -217,7 +299,7 @@ async fn execute_gpu_inner(
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_pipeline(&compute_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch(dimensions.0, dimensions.1, 1);
+        cpass.dispatch(dimensions.0, dimensions.1, num_pieces);
     }
     // Sets adds copy operation to command encoder.
     // Will copy data from storage buffer on GPU to staging buffer on CPU.
@@ -227,11 +309,11 @@ async fn execute_gpu_inner(
             buffer: &staging_buffer,
             layout: wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: std::num::NonZeroU32::new(4 * dimensions.0),
-                rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+                bytes_per_row: std::num::NonZeroU32::new(output_buffer_row_size),
+                rows_per_image: std::num::NonZeroU32::new(piece_height),
             },
         },
-        texture_extent,
+        output_texture_extent,
     );
 
     // Submits command encoder for processing
@@ -249,21 +331,24 @@ async fn execute_gpu_inner(
         let data = slice.get_mapped_range();
         let result: Vec<u8> = bytemuck::cast_slice(&data).to_vec();
 
-        // assert_eq!(&result, image.as_raw());
+        println!("Saving images...");
+        for (i, raw_image) in result
+            .chunks((output_buffer_row_size * piece_height) as usize)
+            .enumerate()
+        {
+            let mut new_image = image::RgbaImage::from_raw(
+                output_buffer_row_size / 4,
+                piece_height,
+                raw_image.to_vec(),
+            )
+            .unwrap();
 
-        let mut new_image = image::RgbaImage::from_raw(dimensions.0, dimensions.1, result).unwrap();
+            let cropped_image =
+                image::imageops::crop(&mut new_image, 0, 0, piece_width, piece_height).to_image();
 
-        let cropped_image = image::imageops::crop(
-            &mut new_image,
-            0,
-            0,
-            original_image_dimensions.0,
-            original_image_dimensions.1,
-        )
-        .to_image();
-
-        println!("Saving image...");
-        cropped_image.save("test-image.png").unwrap();
+            let path = format!("gpu-out/test-image{}.png", i);
+            cropped_image.save(path).unwrap();
+        }
     } else {
         panic!("AHHH")
     }
