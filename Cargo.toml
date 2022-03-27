@@ -13,7 +13,6 @@ ndarray = "0.15.4"
 pollster = "0.2.5"
 rayon = "1.5.1"
 splines = "4.0.3"
-wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "b52d68d5adc3392d3157edcb33f1d5e8470a449a", features = ["trace"] }
 
 [dependencies.clap]
 features = ["derive"]
@@ -22,3 +21,8 @@ version = "3.1.6"
 [dependencies.imageproc]
 git = "https://github.com/image-rs/imageproc"
 rev = "b7942657b1a370fc485507693ed4df1f8a116cb7"
+
+[dependencies.wgpu]
+features = ["trace"]
+git = "https://github.com/gfx-rs/wgpu"
+rev = "b52d68d5adc3392d3157edcb33f1d5e8470a449a"

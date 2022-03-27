@@ -1,20 +1,29 @@
+struct TextureInformation {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32
+};
+
 @group(0) @binding(0) var img_buffer: texture_2d<f32>;
 @group(0) @binding(1) var s: sampler;
 @group(0) @binding(2) var output_tex: texture_storage_3d<rgba8unorm, write>;
-// @group(0) @binding(3) var<storage, read> points_buffer: array<vec2<f32>>;
 @group(0) @binding(3) var<storage, read> points_buffer: array<vec2<f32>>;
+@group(1) @binding(0) var<storage, read> texture_information: array<TextureInformation>;
 
 let PIECE_WIDTH: u32 = $PIECE_WIDTH$u;
 let PIECE_HEIGHT: u32 = $PIECE_HEIGHT$u;
 let NUM_PIECES_X: u32 = $NUM_PIECES_X$u;
 let NUM_PIECES_Y: u32 = $NUM_PIECES_Y$u;
 
-// Check if point (x, y) is inside points_buffer polygon
-fn check_inside(x: f32, y: f32) -> bool {
-    var inside: bool = false;
-    var start = 0u;
+let NUM_SEGMENTS = 321u;
 
-    var end = arrayLength(&points_buffer);
+// Check if point (x, y) is inside points_buffer polygon
+fn check_inside(x: f32, y: f32, offset: u32) -> bool {
+    var inside: bool = false;
+    var start = offset;
+
+    var end = offset + NUM_SEGMENTS;
     var len = (end - start);
 
     var i: i32 = 0;
@@ -55,6 +64,10 @@ fn main(
     // @builtin(workgroup_id) workgroup_id: vec3<u32>,
     // @builtin(local_invocation_id) local_id: vec3<u32>
 ) {
+    let tex_info = texture_information[global_id.z];
+
+    let src_x = tex_info.x + i32(global_id.x);
+    let src_y = tex_info.y + i32(global_id.y);
     // if  (
     //     global_id.x > (global_id.z + 1u) * $PIECE_WIDTH$u ||
     //     global_id.x < global_id.z * $PIECE_WIDTH$u
@@ -62,12 +75,14 @@ fn main(
     //     return;
     // }
     // Only store texels that are contained within the mask polygon
-    if check_inside(f32(global_id.x), f32(global_id.y)) {
+    if check_inside(f32(global_id.x), f32(global_id.y), global_id.z * NUM_SEGMENTS) {
         var color = textureLoad(
             img_buffer,
             vec2<i32>(
-                i32(global_id.x),
-                i32(global_id.y)
+                // i32(global_id.x),
+                // i32(global_id.y),
+                src_x,
+                src_y
             ),
             0
         );
