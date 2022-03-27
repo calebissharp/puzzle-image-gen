@@ -1,5 +1,7 @@
 use std::f64::consts::PI;
 
+use crate::util::find_closest_multiple;
+
 pub const MAX_JOINER_SIZE: u32 = 16;
 
 pub enum Side {
@@ -90,5 +92,41 @@ impl Edge {
         rotate_points(&mut points, half + joiner, half + joiner, angle);
 
         Edge { points }
+    }
+}
+
+#[derive(Debug)]
+pub struct PuzzleDimensions {
+    pub pieces_x: u32,
+    pub pieces_y: u32,
+    pub num_pieces: u32,
+    pub piece_padding: u32,
+    pub piece_width: u32,
+    pub piece_height: u32,
+    pub padded_piece_width: u32,
+    pub width: u32,
+    pub height: u32,
+    pub padded_width: u32,
+}
+
+impl PuzzleDimensions {
+    pub fn new(width: u32, height: u32, pieces_x: u32, pieces_y: u32) -> PuzzleDimensions {
+        let piece_padding = (width / pieces_x) / 6;
+
+        let padded_width = find_closest_multiple(width, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let padded_piece_width = padded_width / pieces_x;
+
+        PuzzleDimensions {
+            width,
+            height,
+            padded_width,
+            pieces_x,
+            pieces_y,
+            num_pieces: pieces_x * pieces_y,
+            piece_width: width / pieces_x + piece_padding * 2,
+            piece_height: height / pieces_y + piece_padding * 2,
+            padded_piece_width,
+            piece_padding,
+        }
     }
 }

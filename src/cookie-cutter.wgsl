@@ -58,7 +58,7 @@ fn check_inside(x: f32, y: f32, offset: u32) -> bool {
 @stage(compute)
 // @workgroup_size($PIECE_WIDTH$, $PIECE_HEIGHT$)
 // @workgroup_size(16, 16, 1)
-@workgroup_size(1)
+@workgroup_size(16, 16, 1)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>
     // @builtin(workgroup_id) workgroup_id: vec3<u32>,

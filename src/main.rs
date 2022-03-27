@@ -1,15 +1,17 @@
 mod piece;
 mod spline;
+mod util;
+
 use core::num;
 use image::GenericImage;
 use image::{open, RgbaImage};
+use log::{debug, error, info, warn};
+use rayon::prelude::*;
 use spline::CatmullRomSpline;
 use std::borrow::Cow;
+use std::time::Instant;
+use util::find_closest_multiple;
 use wgpu::util::DeviceExt;
-
-fn find_closest_multiple(n: u32, x: u32) -> u32 {
-    ((n - 1) | (x - 1)) + 1
-}
 
 async fn run() {
     execute_gpu().await;
@@ -73,8 +75,8 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<()> {
     let src_img_width = 1024;
     let src_img_height = 1024;
     let piece_padding = 32;
-    let pieces_x = 16;
-    let pieces_y = 16;
+    let pieces_x = 32;
+    let pieces_y = 32;
     let num_pieces = pieces_x * pieces_y;
     let img_width = pieces_x * piece_padding + src_img_width;
     let img_height = pieces_y * piece_padding + src_img_height;
@@ -210,44 +212,38 @@ async fn execute_gpu_inner(
 
     let dimensions = image.dimensions();
 
-    let pieces_x = 16;
-    let pieces_y = 16;
-    let num_pieces = pieces_x * pieces_y;
-    let piece_padding = (src_img.width() / pieces_x) / 6;
+    let puzzle_dimensions = piece::PuzzleDimensions::new(src_img.width(), src_img.height(), 16, 16);
 
-    let piece_width = dimensions.0 / pieces_x + piece_padding * 2;
-    let piece_height = dimensions.1 / pieces_y + piece_padding * 2;
+    let output_buffer_row_size = find_closest_multiple(puzzle_dimensions.piece_width * 4, 256);
 
-    let output_buffer_row_size = find_closest_multiple(piece_width * 4, 256);
-
-    println!(
-        "PIECE_WIDTH: {}, PIECE_HEIGHT: {}, NUM_PIECES_X: {}, NUM_PIECES_Y: {}",
-        piece_width, piece_height, pieces_x, pieces_y,
-    );
+    debug!("Puzzle dimensions: {:?}", puzzle_dimensions);
 
     // Loads the shader from WGSL
     let cs_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
             &include_str!("cookie-cutter.wgsl")
-                .replace("$PIECE_WIDTH$", &piece_width.to_string())
-                .replace("$PIECE_HEIGHT$", &piece_height.to_string())
-                .replace("$NUM_PIECES_X$", &pieces_x.to_string())
-                .replace("$NUM_PIECES_Y$", &pieces_y.to_string())
-                .replace("$NUM_PIECES$", &num_pieces.to_string()),
+                .replace("$PIECE_WIDTH$", &puzzle_dimensions.piece_width.to_string())
+                .replace(
+                    "$PIECE_HEIGHT$",
+                    &puzzle_dimensions.piece_height.to_string(),
+                )
+                .replace("$NUM_PIECES_X$", &puzzle_dimensions.pieces_x.to_string())
+                .replace("$NUM_PIECES_Y$", &puzzle_dimensions.pieces_y.to_string())
+                .replace("$NUM_PIECES$", &puzzle_dimensions.num_pieces.to_string()),
         )),
     });
 
     let texture_extent = wgpu::Extent3d {
-        width: dimensions.0,
-        height: dimensions.1,
+        width: puzzle_dimensions.padded_width,
+        height: puzzle_dimensions.height,
         depth_or_array_layers: 1,
     };
 
     let output_texture_extent = wgpu::Extent3d {
-        width: piece_width,
-        height: piece_height,
-        depth_or_array_layers: num_pieces,
+        width: puzzle_dimensions.piece_width,
+        height: puzzle_dimensions.piece_height,
+        depth_or_array_layers: puzzle_dimensions.num_pieces,
     };
 
     let src_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -258,7 +254,7 @@ async fn execute_gpu_inner(
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            // | wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::COPY_DST,
         label: Some("piece-texture"),
     });
@@ -292,26 +288,26 @@ async fn execute_gpu_inner(
 
     println!("Generating control points...");
     let mut all_points = vec![];
-    for i in 0..num_pieces {
+    for i in 0..puzzle_dimensions.num_pieces {
         let top_points = piece::Edge::gen_edge(
             piece::Side::TOP,
-            piece_width - piece_padding * 2,
-            piece_padding,
+            puzzle_dimensions.piece_width - puzzle_dimensions.piece_padding * 2,
+            puzzle_dimensions.piece_padding,
         );
         let mut right_points = piece::Edge::gen_edge(
             piece::Side::RIGHT,
-            piece_height - piece_padding * 2,
-            piece_padding,
+            puzzle_dimensions.piece_height - puzzle_dimensions.piece_padding * 2,
+            puzzle_dimensions.piece_padding,
         );
         let mut bottom_points = piece::Edge::gen_edge(
             piece::Side::BOTTOM,
-            piece_width - piece_padding * 2,
-            piece_padding,
+            puzzle_dimensions.piece_width - puzzle_dimensions.piece_padding * 2,
+            puzzle_dimensions.piece_padding,
         );
         let mut left_points = piece::Edge::gen_edge(
             piece::Side::LEFT,
-            piece_height - piece_padding * 2,
-            piece_padding,
+            puzzle_dimensions.piece_height - puzzle_dimensions.piece_padding * 2,
+            puzzle_dimensions.piece_padding,
         );
 
         let mut control_points = top_points.points;
@@ -405,15 +401,18 @@ async fn execute_gpu_inner(
             }],
         });
 
-    let mut texture_information_data = Vec::<i32>::with_capacity(num_pieces as usize * 4);
-    for x in 0..pieces_x {
-        for y in 0..pieces_y {
-            let x_coord =
-                (x * piece_width) as i32 - (piece_padding * 2 * (x)) as i32 - piece_padding as i32;
-            let y_coord =
-                (y * piece_height) as i32 - (piece_padding * 2 * (y)) as i32 - piece_padding as i32;
-            let width = piece_width;
-            let height = piece_height;
+    let mut texture_information_data =
+        Vec::<i32>::with_capacity(puzzle_dimensions.num_pieces as usize * 4);
+    for x in 0..puzzle_dimensions.pieces_x {
+        for y in 0..puzzle_dimensions.pieces_y {
+            let x_coord = (x * puzzle_dimensions.piece_width) as i32
+                - (puzzle_dimensions.piece_padding * 2 * (x)) as i32
+                - puzzle_dimensions.piece_padding as i32;
+            let y_coord = (y * puzzle_dimensions.piece_height) as i32
+                - (puzzle_dimensions.piece_padding * 2 * (y)) as i32
+                - puzzle_dimensions.piece_padding as i32;
+            let width = puzzle_dimensions.piece_width;
+            let height = puzzle_dimensions.piece_height;
             texture_information_data.push(x_coord);
             texture_information_data.push(y_coord);
             texture_information_data.push(width as i32);
@@ -432,7 +431,9 @@ async fn execute_gpu_inner(
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         mapped_at_creation: false,
-        size: (output_buffer_row_size * piece_height * num_pieces) as u64,
+        size: (output_buffer_row_size
+            * puzzle_dimensions.piece_height
+            * puzzle_dimensions.num_pieces) as u64,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
     });
 
@@ -485,8 +486,6 @@ async fn execute_gpu_inner(
         }],
     });
 
-    println!("bytes_per_row: {}", dimensions.0);
-
     queue.write_texture(
         wgpu::ImageCopyTexture {
             texture: &src_texture,
@@ -497,8 +496,8 @@ async fn execute_gpu_inner(
         &image,
         wgpu::ImageDataLayout {
             offset: 0,
-            bytes_per_row: std::num::NonZeroU32::new(4 * dimensions.0),
-            rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+            bytes_per_row: std::num::NonZeroU32::new(4 * puzzle_dimensions.padded_width),
+            rows_per_image: std::num::NonZeroU32::new(puzzle_dimensions.height),
         },
         texture_extent,
     );
@@ -516,7 +515,13 @@ async fn execute_gpu_inner(
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.set_bind_group(1, &uniform_bind_group, &[]);
 
-        cpass.dispatch(piece_width, piece_height, num_pieces);
+        cpass.dispatch(
+            puzzle_dimensions.piece_width / 16,
+            puzzle_dimensions.piece_height / 16,
+            puzzle_dimensions.num_pieces,
+        );
+
+        // cpass.dispatch(puzzle_dimensions.pieces_x, puzzle_dimensions.pieces_y, 1)
 
         // for x in 0..pieces_x {
         //     for y in 0..pieces_y {
@@ -532,7 +537,7 @@ async fn execute_gpu_inner(
             layout: wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: std::num::NonZeroU32::new(output_buffer_row_size),
-                rows_per_image: std::num::NonZeroU32::new(piece_height),
+                rows_per_image: std::num::NonZeroU32::new(puzzle_dimensions.piece_height),
             },
         },
         output_texture_extent,
@@ -553,26 +558,38 @@ async fn execute_gpu_inner(
         let duration = start.elapsed();
         println!("Took {}ms to generate", duration.as_millis());
         let data = slice.get_mapped_range();
-        let result: Vec<u8> = bytemuck::cast_slice(&data).to_vec();
+        let result: &[u8] = bytemuck::cast_slice(&data);
 
+        let saving_start = Instant::now();
         println!("Saving images...");
-        for (i, raw_image) in result
-            .chunks((output_buffer_row_size * piece_height) as usize)
+        result
+            .par_chunks((output_buffer_row_size * puzzle_dimensions.piece_height) as usize)
             .enumerate()
-        {
-            let mut new_image = image::RgbaImage::from_raw(
-                output_buffer_row_size / 4,
-                piece_height,
-                raw_image.to_vec(),
-            )
-            .unwrap();
+            .for_each(|(i, raw_image)| {
+                let mut new_image = image::RgbaImage::from_raw(
+                    output_buffer_row_size / 4,
+                    puzzle_dimensions.piece_height,
+                    raw_image.to_vec(),
+                )
+                .unwrap();
 
-            let cropped_image =
-                image::imageops::crop(&mut new_image, 0, 0, piece_width, piece_height).to_image();
+                let cropped_image = image::imageops::crop(
+                    &mut new_image,
+                    0,
+                    0,
+                    puzzle_dimensions.piece_width,
+                    puzzle_dimensions.piece_height,
+                )
+                .to_image();
 
-            let path = format!("gpu-out/test-image{}.png", i);
-            cropped_image.save(path).unwrap();
-        }
+                let path = format!("gpu-out/test-image{}.png", i);
+                cropped_image.save(path).unwrap();
+            });
+
+        println!(
+            "Took {}ms to save images",
+            saving_start.elapsed().as_millis()
+        );
     } else {
         panic!("AHHH")
     }
