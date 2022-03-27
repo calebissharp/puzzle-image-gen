@@ -2,10 +2,9 @@ mod piece;
 mod spline;
 mod util;
 
-use core::num;
 use image::GenericImage;
 use image::{open, RgbaImage};
-use log::{debug, error, info, warn};
+use log::debug;
 use rayon::prelude::*;
 use spline::CatmullRomSpline;
 use std::borrow::Cow;
@@ -15,29 +14,6 @@ use wgpu::util::DeviceExt;
 
 async fn run() {
     execute_gpu().await;
-}
-
-struct BufferDimensions {
-    width: usize,
-    height: usize,
-    unpadded_bytes_per_row: usize,
-    padded_bytes_per_row: usize,
-}
-
-impl BufferDimensions {
-    fn new(width: usize, height: usize) -> Self {
-        let bytes_per_pixel = std::mem::size_of::<u32>();
-        let unpadded_bytes_per_row = width * bytes_per_pixel;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-        let padded_bytes_per_row_padding = (align - unpadded_bytes_per_row % align) % align;
-        let padded_bytes_per_row = unpadded_bytes_per_row + padded_bytes_per_row_padding;
-        Self {
-            width,
-            height,
-            unpadded_bytes_per_row,
-            padded_bytes_per_row,
-        }
-    }
 }
 
 async fn execute_gpu() -> Option<()> {
@@ -71,122 +47,6 @@ async fn execute_gpu() -> Option<()> {
     Some(())
 }
 
-async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<()> {
-    let src_img_width = 1024;
-    let src_img_height = 1024;
-    let piece_padding = 32;
-    let pieces_x = 32;
-    let pieces_y = 32;
-    let num_pieces = pieces_x * pieces_y;
-    let img_width = pieces_x * piece_padding + src_img_width;
-    let img_height = pieces_y * piece_padding + src_img_height;
-
-    let buffer_dimensions = BufferDimensions::new(img_width, img_height);
-
-    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (buffer_dimensions.padded_bytes_per_row * buffer_dimensions.height) as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let texture_extent = wgpu::Extent3d {
-        width: buffer_dimensions.width as u32,
-        height: buffer_dimensions.height as u32,
-        depth_or_array_layers: num_pieces as u32,
-    };
-
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        size: texture_extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        label: None,
-    });
-
-    let command_buffer = {
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        for x in 0..pieces_x {
-            for y in 0..pieces_y {
-                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: &[wgpu::RenderPassColorAttachment {
-                        view: &texture.create_view(&wgpu::TextureViewDescriptor {
-                            base_array_layer: 1,
-                            ..Default::default()
-                        }),
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                            store: true,
-                        },
-                    }],
-                    depth_stencil_attachment: None,
-                });
-
-                encoder.clear_texture(
-                    &texture,
-                    &wgpu::ImageSubresourceRange {
-                        ..Default::default()
-                    },
-                )
-            }
-        }
-
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            wgpu::ImageCopyBuffer {
-                buffer: &output_buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(
-                        std::num::NonZeroU32::new(buffer_dimensions.padded_bytes_per_row as u32)
-                            .unwrap(),
-                    ),
-                    rows_per_image: None,
-                },
-            },
-            texture_extent,
-        );
-
-        encoder.finish()
-    };
-
-    queue.submit(Some(command_buffer));
-
-    let buffer_slice = output_buffer.slice(..);
-    let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
-
-    device.poll(wgpu::Maintain::Wait);
-
-    if let Ok(()) = buffer_future.await {
-        let data = buffer_slice.get_mapped_range();
-        let result: Vec<u8> = bytemuck::cast_slice(&data).to_vec();
-
-        println!("result length {}", result.len());
-        println!(
-            "{}",
-            buffer_dimensions.padded_bytes_per_row * buffer_dimensions.height
-        );
-
-        println!("Saving mask image...");
-        let image = image::RgbaImage::from_raw(
-            buffer_dimensions.width as u32,
-            buffer_dimensions.height as u32,
-            result,
-        )
-        .unwrap();
-
-        image.save("mask.png").unwrap();
-    }
-
-    Some(())
-}
-
 async fn execute_gpu_inner(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -194,7 +54,6 @@ async fn execute_gpu_inner(
 ) -> Option<()> {
     let start = std::time::Instant::now();
 
-    let original_image_dimensions = src_img.dimensions();
     // Image width needs to be a multiple of 256 in order
     // for copy_texture_to_buffer to work
     let mut image = RgbaImage::new(
@@ -202,15 +61,13 @@ async fn execute_gpu_inner(
         src_img.height(),
     );
     println!(
-        "Padding image for GPU\nOriginal: ({}x{}), New: ({}x{})",
+        "Padding image for GPU, Original: ({}x{}), New: ({}x{})",
         src_img.width(),
         src_img.height(),
         image.width(),
         image.height(),
     );
     image.copy_from(&src_img, 0, 0).unwrap();
-
-    let dimensions = image.dimensions();
 
     let puzzle_dimensions = piece::PuzzleDimensions::new(src_img.width(), src_img.height(), 16, 16);
 
@@ -287,8 +144,9 @@ async fn execute_gpu_inner(
     // let piece_height = 168;
 
     println!("Generating control points...");
+    let gen_start = Instant::now();
     let mut all_points = vec![];
-    for i in 0..puzzle_dimensions.num_pieces {
+    for _i in 0..puzzle_dimensions.num_pieces {
         let top_points = piece::Edge::gen_edge(
             piece::Side::TOP,
             puzzle_dimensions.piece_width - puzzle_dimensions.piece_padding * 2,
@@ -330,9 +188,11 @@ async fn execute_gpu_inner(
         all_points.append(&mut curve_points);
     }
 
-    println!("Generated {} control points!", all_points.len());
-
-    println!("{}", all_points[0]);
+    println!(
+        "Generated {} control points in {}µs",
+        all_points.len(),
+        gen_start.elapsed().as_micros()
+    );
 
     let points_buffer_size = (all_points.len() * std::mem::size_of::<f32>()) as u64;
 
@@ -419,8 +279,6 @@ async fn execute_gpu_inner(
             texture_information_data.push(height as i32);
         }
     }
-
-    println!("{:?}", &texture_information_data[0..8]);
 
     let texture_information_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
@@ -556,7 +414,7 @@ async fn execute_gpu_inner(
 
     if let Ok(()) = buffer_future.await {
         let duration = start.elapsed();
-        println!("Took {}ms to generate", duration.as_millis());
+        println!("Took {}ms to render and copy buffers", duration.as_millis());
         let data = slice.get_mapped_range();
         let result: &[u8] = bytemuck::cast_slice(&data);
 
@@ -598,6 +456,7 @@ async fn execute_gpu_inner(
 }
 
 fn main() {
+    let start = Instant::now();
     #[cfg(not(target_arch = "wasm32"))]
     {
         env_logger::init();
@@ -609,4 +468,6 @@ fn main() {
         console_log::init().expect("could not initialize logger");
         wasm_bindgen_futures::spawn_local(run());
     }
+
+    println!("\nFinished in {}ms.", start.elapsed().as_millis());
 }
