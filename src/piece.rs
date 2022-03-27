@@ -58,8 +58,8 @@ pub struct Edge {
 }
 
 impl Edge {
-    pub fn gen_edge(side: Side, side_length: u32) -> Edge {
-        let joiner = MAX_JOINER_SIZE as f64;
+    pub fn gen_edge(side: Side, side_length: u32, padding: u32) -> Edge {
+        let joiner = padding as f64;
 
         let width = side_length as f64;
 

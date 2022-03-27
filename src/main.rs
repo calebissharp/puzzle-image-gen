@@ -213,7 +213,7 @@ async fn execute_gpu_inner(
     let pieces_x = 16;
     let pieces_y = 16;
     let num_pieces = pieces_x * pieces_y;
-    let piece_padding = 16;
+    let piece_padding = (src_img.width() / pieces_x) / 6;
 
     let piece_width = dimensions.0 / pieces_x + piece_padding * 2;
     let piece_height = dimensions.1 / pieces_y + piece_padding * 2;
@@ -293,13 +293,26 @@ async fn execute_gpu_inner(
     println!("Generating control points...");
     let mut all_points = vec![];
     for i in 0..num_pieces {
-        let top_points = piece::Edge::gen_edge(piece::Side::TOP, piece_width - piece_padding * 2);
-        let mut right_points =
-            piece::Edge::gen_edge(piece::Side::RIGHT, piece_height - piece_padding * 2);
-        let mut bottom_points =
-            piece::Edge::gen_edge(piece::Side::BOTTOM, piece_width - piece_padding * 2);
-        let mut left_points =
-            piece::Edge::gen_edge(piece::Side::LEFT, piece_height - piece_padding * 2);
+        let top_points = piece::Edge::gen_edge(
+            piece::Side::TOP,
+            piece_width - piece_padding * 2,
+            piece_padding,
+        );
+        let mut right_points = piece::Edge::gen_edge(
+            piece::Side::RIGHT,
+            piece_height - piece_padding * 2,
+            piece_padding,
+        );
+        let mut bottom_points = piece::Edge::gen_edge(
+            piece::Side::BOTTOM,
+            piece_width - piece_padding * 2,
+            piece_padding,
+        );
+        let mut left_points = piece::Edge::gen_edge(
+            piece::Side::LEFT,
+            piece_height - piece_padding * 2,
+            piece_padding,
+        );
 
         let mut control_points = top_points.points;
         control_points.append(&mut right_points.points);
@@ -309,7 +322,7 @@ async fn execute_gpu_inner(
 
         let spline = CatmullRomSpline::new(control_points.clone(), 0.5, true);
 
-        let step = 10;
+        let step = 5;
 
         let mut curve_points = (0..(spline.control_points.len() - 1) * step)
             .map(|x| spline.sample(x as f64 / step as f64).unwrap().transpose())

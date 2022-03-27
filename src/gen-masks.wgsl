@@ -1,12 +1,3 @@
-struct TextureInformation {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32
-};
-
-@group(0) @binding(0) var img_buffer: texture_2d<f32>;
-@group(0) @binding(1) var s: sampler;
 @group(0) @binding(2) var output_tex: texture_storage_3d<rgba8unorm, write>;
 @group(0) @binding(3) var<storage, read> points_buffer: array<vec2<f32>>;
 @group(1) @binding(0) var<storage, read> texture_information: array<TextureInformation>;
@@ -16,7 +7,7 @@ let PIECE_HEIGHT: u32 = $PIECE_HEIGHT$u;
 let NUM_PIECES_X: u32 = $NUM_PIECES_X$u;
 let NUM_PIECES_Y: u32 = $NUM_PIECES_Y$u;
 
-let NUM_SEGMENTS = 161u;
+let NUM_SEGMENTS = 321u;
 
 // Check if point (x, y) is inside points_buffer polygon
 fn check_inside(x: f32, y: f32, offset: u32) -> bool {
@@ -56,13 +47,9 @@ fn check_inside(x: f32, y: f32, offset: u32) -> bool {
 }
 
 @stage(compute)
-// @workgroup_size($PIECE_WIDTH$, $PIECE_HEIGHT$)
-// @workgroup_size(16, 16, 1)
 @workgroup_size(1)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>
-    // @builtin(workgroup_id) workgroup_id: vec3<u32>,
-    // @builtin(local_invocation_id) local_id: vec3<u32>
 ) {
     let tex_info = texture_information[global_id.z];
 
@@ -75,25 +62,8 @@ fn main(
     //     return;
     // }
     // Only store texels that are contained within the mask polygon
-    let top_left = check_inside(f32(global_id.x), f32(global_id.y), global_id.z * NUM_SEGMENTS);
-    let top_right = check_inside(f32(global_id.x) + 0.5, f32(global_id.y), global_id.z * NUM_SEGMENTS);
-    let bottom_left = check_inside(f32(global_id.x), f32(global_id.y) + 0.5, global_id.z * NUM_SEGMENTS);
-    let bottom_right = check_inside(f32(global_id.x) + 0.5, f32(global_id.y) + 0.5, global_id.z * NUM_SEGMENTS);
-
-    if top_left || top_right || bottom_left || bottom_right {
-        let opacity = f32(top_left) + f32(top_right) + f32(bottom_left) + f32(bottom_right);
-        var color = textureLoad(
-            img_buffer,
-            vec2<i32>(
-                // i32(global_id.x),
-                // i32(global_id.y),
-                src_x,
-                src_y
-            ),
-            0
-        );
-
-        color[3] = opacity / 4.;
+    if check_inside(f32(global_id.x), f32(global_id.y), global_id.z * NUM_SEGMENTS) {
+        var color = vec4<f32>(0., 0., 0., 1.);
 
         textureStore(
             output_tex,
