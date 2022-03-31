@@ -5,6 +5,7 @@ mod util;
 use image::GenericImage;
 use image::{open, RgbaImage};
 use log::debug;
+use piece::Puzzle;
 use rayon::prelude::*;
 use spline::CatmullRomSpline;
 use std::borrow::Cow;
@@ -20,7 +21,7 @@ async fn execute_gpu() -> Option<()> {
     // Instantiates instance of WebGPU
     let instance = wgpu::Instance::new(wgpu::Backends::all());
 
-    let img = open("./test-images/chungus.jpg").unwrap().to_rgba8();
+    let img = open("./test-images/uv.jpg").unwrap().to_rgba8();
 
     // `request_adapter` instantiates the general connection to the GPU
     let adapter = instance
@@ -33,7 +34,7 @@ async fn execute_gpu() -> Option<()> {
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                features: wgpu::Features::empty(),
+                features: wgpu::Features::POLYGON_MODE_LINE,
                 limits: wgpu::Limits::default(),
             },
             None,
@@ -41,8 +42,332 @@ async fn execute_gpu() -> Option<()> {
         .await
         .unwrap();
 
-    execute_gpu_inner(&device, &queue, img).await;
-    // draw_masks(&device, &queue).await;
+    // execute_gpu_inner(&device, &queue, img).await;
+    draw_masks(&device, &queue, img).await;
+
+    Some(())
+}
+
+async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaImage) -> Option<()> {
+    // let puzzle = Puzzle::new(3897, 3801, 16, 16);
+    let puzzle = Puzzle::new(1024, 1024, 32, 32);
+
+    let render_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("./gen-masks.wgsl"))),
+    });
+
+    let generate_start = Instant::now();
+
+    let mut buffer_sizes = vec![];
+    let mut buffer_offsets = vec![];
+    let mut all_tris = vec![];
+
+    for x in 0..puzzle.dimensions.pieces_x {
+        for y in 0..puzzle.dimensions.pieces_y {
+            let points = puzzle.get_piece_points(x, y);
+
+            let triangles = earcutr::earcut(&points, &vec![], 2);
+
+            let mut tris = vec![];
+
+            for point in triangles {
+                tris.push(util::normalize_range(
+                    points[point * 2],
+                    0.,
+                    puzzle.dimensions.piece_width as f32
+                        + puzzle.dimensions.piece_padding as f32 * 2.,
+                    -1. + (2. / puzzle.dimensions.pieces_x as f32) * x as f32,
+                    -1. + (2. / puzzle.dimensions.pieces_x as f32) * (x as f32 + 1.),
+                ));
+                tris.push(util::normalize_range(
+                    points[point * 2 + 1],
+                    0.,
+                    puzzle.dimensions.piece_height as f32
+                        + puzzle.dimensions.piece_padding as f32 * 2.,
+                    -1. + (2. / puzzle.dimensions.pieces_y as f32) * y as f32,
+                    -1. + (2. / puzzle.dimensions.pieces_y as f32) * (y as f32 + 1.),
+                ));
+
+                // tris.push(util::normalize(
+                //     points[triangle[1] * 2],
+                //     0.,
+                //     puzzle.dimensions.piece_width as f32
+                //         + puzzle.dimensions.piece_padding as f32 * 2.,
+                // ));
+                // tris.push(util::normalize(
+                //     points[triangle[1] * 2 + 1],
+                //     0.,
+                //     puzzle.dimensions.piece_height as f32
+                //         + puzzle.dimensions.piece_padding as f32 * 2.,
+                // ));
+
+                // tris.push(util::normalize(
+                //     points[triangle[2] * 2],
+                //     0.,
+                //     puzzle.dimensions.piece_width as f32
+                //         + puzzle.dimensions.piece_padding as f32 * 2.,
+                // ));
+                // tris.push(util::normalize(
+                //     points[triangle[2] * 2 + 1],
+                //     0.,
+                //     puzzle.dimensions.piece_height as f32
+                //         + puzzle.dimensions.piece_padding as f32 * 2.,
+                // ));
+            }
+
+            buffer_sizes.push(tris.len());
+            buffer_offsets.push(all_tris.len());
+
+            all_tris.append(&mut tris);
+        }
+    }
+
+    println!(
+        "Generated {} tris in {}ms",
+        all_tris.len() / 3,
+        generate_start.elapsed().as_millis()
+    );
+
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        contents: &bytemuck::cast_slice(&all_tris),
+        label: None,
+        usage: wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::UNIFORM,
+    });
+
+    let mask_output_size = wgpu::Extent3d {
+        width: util::find_closest_multiple(
+            (puzzle.dimensions.padded_piece_width + puzzle.dimensions.piece_padding * 2)
+                * puzzle.dimensions.pieces_x,
+            wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+        ),
+        height: (puzzle.dimensions.piece_height + puzzle.dimensions.piece_padding * 2)
+            * puzzle.dimensions.pieces_y,
+        depth_or_array_layers: 1,
+    };
+
+    let sample_count = 1;
+
+    let mask_output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Mask output texture"),
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        mip_level_count: 1,
+        sample_count,
+        size: mask_output_size,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+    });
+
+    let mask_output_texture_view =
+        mask_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Mask output texture"),
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        mip_level_count: 1,
+        sample_count: 1,
+        size: mask_output_size,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+    });
+
+    let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mask_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        mapped_at_creation: false,
+        size: (mask_output_size.width * mask_output_size.height * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let uniform_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+            //     wgpu::BindGroupLayoutEntry {
+            //     binding: 0,
+            //     visibility: wgpu::ShaderStages::VERTEX,
+            //     count: None,
+            //     ty: wgpu::BindingType::Buffer {
+            //         ty: wgpu::BufferBindingType::Uniform,
+            //         has_dynamic_offset: false,
+            //         min_binding_size: None,
+            //     },
+            // }
+            ],
+        });
+
+    let render_mask_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render masks pipeline layout"),
+            bind_group_layouts: &[
+                // &uniform_bind_group_layout
+            ],
+            push_constant_ranges: &[],
+        });
+
+    // let mask_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    //     label: None,
+    //     layout: &uniform_bind_group_layout,
+    //     entries: &[wgpu::BindGroupEntry {
+    //         binding: 0,
+    //         resource: buffers[0].as_entire_binding(),
+    //     }],
+    // });
+
+    // img.save("something.png").unwrap();
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Mask render pipeline"),
+        // layout: Some(&render_mask_pipeline_layout),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &render_shader,
+            entry_point: "vs_main",
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: 8,
+                attributes: &[wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 0,
+                }],
+                step_mode: wgpu::VertexStepMode::Vertex,
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &render_shader,
+            entry_point: "fs_main",
+            targets: &[wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::default(),
+            }],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            ..wgpu::PrimitiveState::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview: None,
+    });
+
+    // A command encoder executes one or many pipelines.
+    // It is to WebGPU what a command buffer is to Vulkan.
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[wgpu::RenderPassColorAttachment {
+                view: &mask_output_texture_view,
+                // resolve_target: Some(&output_texture_view),
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
+                    store: true,
+                },
+            }],
+            depth_stencil_attachment: None,
+        });
+        rpass.set_pipeline(&render_pipeline);
+        // let points_per_piece = vertices.len() as u32 / puzzle_dimensions.num_pieces;
+        // for i in 0..puzzle.dimensions.num_pieces {
+        // let offset = (i as wgpu::DynamicOffset) * (uniform_alignment as wgpu::DynamicOffset);
+        // rpass.set_bind_group(0, &mask_bind_group, &[]);
+        for i in 0..(puzzle.dimensions.num_pieces as usize) {
+            // let i = 5;
+            let buffer_size = buffer_sizes[i] as u64;
+            // let slice = buffer.slice(..);
+            let slice = buffer.slice(
+                (buffer_offsets[i] as u64 * 4)
+                    ..(buffer_offsets[i] as u64 * 4 + buffer_size * 4 as u64),
+            );
+
+            rpass.set_vertex_buffer(0, slice);
+            rpass.draw(
+                0..(buffer_size / 2) as u32,
+                // 0..100,
+                0..1,
+            );
+        }
+        // }
+    }
+
+    encoder.copy_texture_to_buffer(
+        mask_output_texture.as_image_copy(),
+        wgpu::ImageCopyBuffer {
+            buffer: &mask_staging_buffer,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: std::num::NonZeroU32::new(mask_output_size.width * 4),
+                rows_per_image: std::num::NonZeroU32::new(mask_output_size.height),
+            },
+        },
+        mask_output_size,
+    );
+
+    let render_start = Instant::now();
+
+    // Submits command encoder for processing
+    queue.submit(Some(encoder.finish()));
+
+    let render_slice = mask_staging_buffer.slice(..);
+    let render_buffer_future = render_slice.map_async(wgpu::MapMode::Read);
+
+    // Poll the device in a blocking manner so that our future resolves.
+    // In an actual application, `device.poll(...)` should
+    // be called in an event loop or on another thread.
+    device.poll(wgpu::Maintain::Wait);
+
+    println!(
+        "Took {}ms to render {} pieces",
+        render_start.elapsed().as_millis(),
+        puzzle.dimensions.num_pieces
+    );
+
+    if let Ok(()) = render_buffer_future.await {
+        let data = render_slice.get_mapped_range();
+        let result: &[u8] = bytemuck::cast_slice(&data);
+
+        let saving_start = Instant::now();
+        println!("Saving images...");
+        let mut image = image::RgbaImage::from_raw(
+            mask_output_size.width,
+            mask_output_size.height,
+            result.to_vec(),
+        )
+        .unwrap();
+
+        let path = format!("mask.png",);
+        image.save(path).unwrap();
+
+        println!(
+            "Took {}ms to save images",
+            saving_start.elapsed().as_millis()
+        );
+    } else {
+        panic!("AHHH")
+    }
 
     Some(())
 }
@@ -89,6 +414,11 @@ async fn execute_gpu_inner(
                 .replace("$NUM_PIECES_Y$", &puzzle_dimensions.pieces_y.to_string())
                 .replace("$NUM_PIECES$", &puzzle_dimensions.num_pieces.to_string()),
         )),
+    });
+
+    let render_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("./gen-masks.wgsl"))),
     });
 
     let texture_extent = wgpu::Extent3d {
@@ -174,7 +504,15 @@ async fn execute_gpu_inner(
         control_points.append(&mut left_points.points);
         // control_points.push(control_points[0]);
 
-        let spline = CatmullRomSpline::new(control_points.clone(), 0.5, true);
+        let spline = CatmullRomSpline::new(
+            control_points
+                .clone()
+                .chunks(2)
+                .map(|c| [c[0] as f64, c[1] as f64])
+                .collect::<Vec<[f64; 2]>>(),
+            0.5,
+            true,
+        );
 
         let step = 5;
 
@@ -200,7 +538,9 @@ async fn execute_gpu_inner(
         label: None,
         mapped_at_creation: false,
         size: points_buffer_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::UNIFORM,
     });
 
     let texture_bind_group_layout =
@@ -280,6 +620,68 @@ async fn execute_gpu_inner(
         }
     }
 
+    let mask_output_size = wgpu::Extent3d {
+        width: (puzzle_dimensions.padded_piece_width + puzzle_dimensions.piece_padding * 2)
+            * puzzle_dimensions.pieces_x,
+        height: (puzzle_dimensions.piece_height + puzzle_dimensions.piece_padding * 2)
+            * puzzle_dimensions.pieces_y,
+        depth_or_array_layers: 1,
+    };
+
+    println!("Mask output texture size {:?}", mask_output_size);
+
+    let mask_output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Mask output texture"),
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        mip_level_count: 1,
+        sample_count: 1,
+        size: mask_output_size,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+    });
+
+    // let vertices = all_points
+    //     .windows(3)
+    //     .flat_map(|x| x.to_owned())
+    //     .collect::<Vec<f32>>();
+
+    let vertices = (0..puzzle_dimensions.num_pieces)
+        .flat_map(|i| [0., 0., 0.5, 0., 0.5, 1.])
+        .collect::<Vec<f32>>();
+
+    let vertices_slice: &[u8] = bytemuck::cast_slice(&vertices);
+
+    let uniform_alignment =
+        device.limits().min_uniform_buffer_offset_alignment as wgpu::BufferAddress;
+
+    let aligned_vertices = unsafe {
+        std::slice::from_raw_parts(
+            vertices_slice.as_ptr(),
+            vertices_slice.len() * uniform_alignment as usize,
+        )
+    };
+
+    let mask_curves_vertices_buffer =
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Mask curve vertices"),
+            contents: vertices_slice,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST,
+        });
+
+    // let mask_curves_vertices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    //     label: Some("Mask curve vertices"),
+    //     size: aligned_vertices.len() as u64,
+    //     mapped_at_creation: false,
+    //     usage: wgpu::BufferUsages::VERTEX
+    //         | wgpu::BufferUsages::UNIFORM
+    //         | wgpu::BufferUsages::COPY_DST,
+    // });
+
     let texture_information_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::cast_slice(&texture_information_data),
@@ -295,20 +697,76 @@ async fn execute_gpu_inner(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
     });
 
+    let mask_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        mapped_at_creation: false,
+        size: (mask_output_size.width * mask_output_size.height * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let mask_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                count: None,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+            }],
+        });
+
     // A pipeline specifies the operation of a shader
 
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &[&texture_bind_group_layout, &uniform_bind_group_layout],
         push_constant_ranges: &[],
     });
 
+    let render_mask_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render masks pipeline layout"),
+            bind_group_layouts: &[&mask_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
     // Instantiates the pipeline.
     let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
-        layout: Some(&pipeline_layout),
+        layout: Some(&compute_pipeline_layout),
         module: &cs_module,
         entry_point: "main",
+    });
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Mask render pipeline"),
+        layout: Some(&render_mask_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &render_shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &render_shader,
+            entry_point: "fs_main",
+            targets: &[wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::default(),
+            }],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            ..wgpu::PrimitiveState::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
     });
 
     // Instantiates the bind group, once again specifying the binding of buffers.
@@ -344,6 +802,21 @@ async fn execute_gpu_inner(
         }],
     });
 
+    let mask_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &mask_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &mask_curves_vertices_buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(
+                    vertices.len() as u64 / puzzle_dimensions.num_pieces as u64,
+                ),
+            }),
+        }],
+    });
+
     queue.write_texture(
         wgpu::ImageCopyTexture {
             texture: &src_texture,
@@ -362,10 +835,42 @@ async fn execute_gpu_inner(
 
     queue.write_buffer(&curve_points_buffer, 0, bytemuck::cast_slice(&all_points));
 
+    // queue.write_buffer(&mask_curves_vertices_buffer, 0, aligned_vertices);
+
+    let mask_output_texture_view =
+        mask_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
     // A command encoder executes one or many pipelines.
     // It is to WebGPU what a command buffer is to Vulkan.
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[wgpu::RenderPassColorAttachment {
+                view: &mask_output_texture_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
+                    store: true,
+                },
+            }],
+            depth_stencil_attachment: None,
+        });
+        rpass.set_pipeline(&render_pipeline);
+        let points_per_piece = vertices.len() as u32 / puzzle_dimensions.num_pieces;
+        for i in 0..puzzle_dimensions.num_pieces {
+            let offset = (i as wgpu::DynamicOffset) * (uniform_alignment as wgpu::DynamicOffset);
+            rpass.set_bind_group(0, &mask_bind_group, &[i * points_per_piece]);
+            rpass.draw(0..points_per_piece, 0..1);
+        }
+    }
 
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
@@ -401,16 +906,56 @@ async fn execute_gpu_inner(
         output_texture_extent,
     );
 
+    encoder.copy_texture_to_buffer(
+        mask_output_texture.as_image_copy(),
+        wgpu::ImageCopyBuffer {
+            buffer: &mask_staging_buffer,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: std::num::NonZeroU32::new(mask_output_size.width * 4),
+                rows_per_image: std::num::NonZeroU32::new(mask_output_size.height),
+            },
+        },
+        mask_output_size,
+    );
+
     // Submits command encoder for processing
     queue.submit(Some(encoder.finish()));
 
     let slice = staging_buffer.slice(..);
     let buffer_future = slice.map_async(wgpu::MapMode::Read);
 
+    let render_slice = mask_staging_buffer.slice(..);
+    let render_buffer_future = render_slice.map_async(wgpu::MapMode::Read);
+
     // Poll the device in a blocking manner so that our future resolves.
     // In an actual application, `device.poll(...)` should
     // be called in an event loop or on another thread.
     device.poll(wgpu::Maintain::Wait);
+
+    if let Ok(()) = render_buffer_future.await {
+        let data = render_slice.get_mapped_range();
+        let result: &[u8] = bytemuck::cast_slice(&data);
+
+        let saving_start = Instant::now();
+        println!("Saving images...");
+        let mut image = image::RgbaImage::from_raw(
+            mask_output_size.width,
+            mask_output_size.height,
+            result.to_vec(),
+        )
+        .unwrap();
+
+        let path = format!("mask.png",);
+        image.save(path).unwrap();
+
+        println!(
+            "Took {}ms to save images",
+            saving_start.elapsed().as_millis()
+        );
+    } else {
+        panic!("AHHH")
+    }
 
     if let Ok(()) = buffer_future.await {
         let duration = start.elapsed();

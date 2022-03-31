@@ -23,6 +23,8 @@ fn check_inside(x: f32, y: f32, offset: u32) -> bool {
     var inside: bool = false;
     var start = offset;
 
+    var intersections = 0u;
+
     var end = offset + NUM_SEGMENTS;
     var len = (end - start);
 
@@ -43,16 +45,14 @@ fn check_inside(x: f32, y: f32, offset: u32) -> bool {
         var yj = points_buffer[start + j][1];
         var intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
 
-        if (intersect) {
-            inside = !inside;
-        }
+        intersections += u32(intersect);
 
         continuing {
             i = i + 1;
         }
     }
 
-    return inside;
+    return intersections % 2u != 0u;
 }
 
 @stage(compute)
