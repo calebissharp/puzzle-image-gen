@@ -63,7 +63,7 @@ pub struct Edge {
 }
 
 impl Edge {
-    pub fn gen_edge(side: Side, side_length: u32, padding: u32) -> Edge {
+    pub fn gen_edge(side_length: u32, padding: u32) -> Edge {
         let mut rng = rand::thread_rng();
 
         let joiner = padding as f64;
@@ -89,15 +89,6 @@ impl Edge {
         if inverted {
             reflect_points_vertical(&mut control_points, joiner);
         }
-
-        let angle = match side {
-            Side::TOP => 0.,
-            Side::RIGHT => PI / 2.,
-            Side::BOTTOM => PI,
-            Side::LEFT => PI * 1.5,
-        };
-
-        // rotate_points(&mut control_points, half + joiner, half + joiner, angle);
 
         let spline = CatmullRomSpline::new(control_points, 0.5, false);
 
@@ -140,6 +131,17 @@ impl Edge {
             Side::LEFT => PI * 1.5,
         };
 
+        let invert = match side {
+            Side::TOP => false,
+            Side::RIGHT => false,
+            Side::BOTTOM => true,
+            Side::LEFT => true,
+        };
+
+        if invert {
+            reflect_points_vertical(&mut points, self.padding as f64);
+        }
+
         rotate_points(
             &mut points,
             half + self.padding as f64,
@@ -154,30 +156,18 @@ impl Edge {
             .collect::<Vec<f32>>()
     }
 
-    pub fn flat(side: Side, side_length: u32, padding: u32) -> Edge {
-        let joiner = padding as f64;
+    pub fn flat(side_length: u32, padding: u32) -> Edge {
+        let joiner = padding as f32;
 
-        let width = side_length as f64;
+        let width = side_length as f32;
 
-        let half = width / 2.;
+        let mut points = vec![joiner, joiner, joiner + width, joiner];
 
-        let mut points = vec![[joiner, joiner], [joiner + width, joiner]];
-
-        let angle = match side {
-            Side::TOP => 0.,
-            Side::RIGHT => PI / 2.,
-            Side::BOTTOM => PI,
-            Side::LEFT => PI * 1.5,
-        };
-
-        rotate_points(&mut points, half + joiner, half + joiner, angle);
+        points.pop();
+        points.pop();
 
         Edge {
-            points: points
-                .iter()
-                .flatten()
-                .map(|x| x.to_owned() as f32)
-                .collect::<Vec<f32>>(),
+            points,
             side_length,
             padding,
         }
@@ -236,51 +226,27 @@ impl Puzzle {
         let mut edges = Vec::with_capacity(total_edges as usize);
 
         let mut top_edges = (0..pieces_x)
-            .map(|_| Edge::flat(Side::TOP, dimensions.piece_width, dimensions.piece_padding))
+            .map(|_| Edge::flat(dimensions.piece_width, dimensions.piece_padding))
             .collect::<Vec<Edge>>();
 
         let mut bottom_edges = (0..pieces_x)
-            .map(|_| {
-                Edge::flat(
-                    Side::BOTTOM,
-                    dimensions.piece_width,
-                    dimensions.piece_padding,
-                )
-            })
+            .map(|_| Edge::flat(dimensions.piece_width, dimensions.piece_padding))
             .collect::<Vec<Edge>>();
 
         let mut interior_horiz = (0..pieces_x * (pieces_y - 1))
-            .map(|_| Edge::gen_edge(Side::TOP, dimensions.piece_width, dimensions.piece_padding))
+            .map(|_| Edge::gen_edge(dimensions.piece_width, dimensions.piece_padding))
             .collect::<Vec<Edge>>();
 
         let mut interior_vert = (0..(pieces_x - 1) * pieces_y)
-            .map(|_| {
-                Edge::gen_edge(
-                    Side::RIGHT,
-                    dimensions.piece_height,
-                    dimensions.piece_padding,
-                )
-            })
+            .map(|_| Edge::gen_edge(dimensions.piece_height, dimensions.piece_padding))
             .collect::<Vec<Edge>>();
 
         let mut left_edges = (0..pieces_y)
-            .map(|_| {
-                Edge::flat(
-                    Side::LEFT,
-                    dimensions.piece_height,
-                    dimensions.piece_padding,
-                )
-            })
+            .map(|_| Edge::flat(dimensions.piece_height, dimensions.piece_padding))
             .collect::<Vec<Edge>>();
 
         let mut right_edges = (0..pieces_y)
-            .map(|_| {
-                Edge::flat(
-                    Side::RIGHT,
-                    dimensions.piece_height,
-                    dimensions.piece_padding,
-                )
-            })
+            .map(|_| Edge::flat(dimensions.piece_height, dimensions.piece_padding))
             .collect::<Vec<Edge>>();
 
         edges.append(&mut top_edges);
@@ -300,22 +266,29 @@ impl Puzzle {
 
     pub fn top_edge(&self, x: u32, y: u32) -> &Edge {
         let i = self.xy_to_index(x, y);
-        &self.edges[i]
+        &self.edges[(y * self.dimensions.pieces_x + x) as usize]
     }
 
     pub fn bottom_edge(&self, x: u32, y: u32) -> &Edge {
         let i = self.xy_to_index(x, y);
-        &self.edges[i + self.dimensions.pieces_x as usize]
+        &self.edges[(y * self.dimensions.pieces_x + x + self.dimensions.pieces_x) as usize]
     }
 
     pub fn left_edge(&self, x: u32, y: u32) -> &Edge {
         let i = self.xy_to_index(x, y);
-        &self.edges[i + self.dimensions.num_pieces as usize + self.dimensions.pieces_x as usize]
+        &self.edges[(self.dimensions.num_pieces
+            + self.dimensions.pieces_x
+            + self.dimensions.pieces_y * x
+            + y) as usize]
     }
 
     pub fn right_edge(&self, x: u32, y: u32) -> &Edge {
         let i = self.xy_to_index(x, y);
-        &self.edges[i + self.dimensions.num_pieces as usize + self.dimensions.pieces_x as usize + 1]
+        &self.edges[(self.dimensions.num_pieces
+            + self.dimensions.pieces_x
+            + self.dimensions.pieces_y * x
+            + y
+            + self.dimensions.pieces_y) as usize]
     }
 
     pub fn get_piece_points(&self, x: u32, y: u32) -> Vec<f32> {

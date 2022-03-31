@@ -50,7 +50,7 @@ async fn execute_gpu() -> Option<()> {
 
 async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaImage) -> Option<()> {
     // let puzzle = Puzzle::new(3897, 3801, 16, 16);
-    let puzzle = Puzzle::new(1024, 1024, 32, 32);
+    let puzzle = Puzzle::new(1024, 1024, 16, 16);
 
     let render_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
         label: None,
@@ -88,32 +88,6 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
                     -1. + (2. / puzzle.dimensions.pieces_y as f32) * y as f32,
                     -1. + (2. / puzzle.dimensions.pieces_y as f32) * (y as f32 + 1.),
                 ));
-
-                // tris.push(util::normalize(
-                //     points[triangle[1] * 2],
-                //     0.,
-                //     puzzle.dimensions.piece_width as f32
-                //         + puzzle.dimensions.piece_padding as f32 * 2.,
-                // ));
-                // tris.push(util::normalize(
-                //     points[triangle[1] * 2 + 1],
-                //     0.,
-                //     puzzle.dimensions.piece_height as f32
-                //         + puzzle.dimensions.piece_padding as f32 * 2.,
-                // ));
-
-                // tris.push(util::normalize(
-                //     points[triangle[2] * 2],
-                //     0.,
-                //     puzzle.dimensions.piece_width as f32
-                //         + puzzle.dimensions.piece_padding as f32 * 2.,
-                // ));
-                // tris.push(util::normalize(
-                //     points[triangle[2] * 2 + 1],
-                //     0.,
-                //     puzzle.dimensions.piece_height as f32
-                //         + puzzle.dimensions.piece_padding as f32 * 2.,
-                // ));
             }
 
             buffer_sizes.push(tris.len());
@@ -295,7 +269,7 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
         // let offset = (i as wgpu::DynamicOffset) * (uniform_alignment as wgpu::DynamicOffset);
         // rpass.set_bind_group(0, &mask_bind_group, &[]);
         for i in 0..(puzzle.dimensions.num_pieces as usize) {
-            // let i = 5;
+            // let i = 31;
             let buffer_size = buffer_sizes[i] as u64;
             // let slice = buffer.slice(..);
             let slice = buffer.slice(
@@ -478,22 +452,18 @@ async fn execute_gpu_inner(
     let mut all_points = vec![];
     for _i in 0..puzzle_dimensions.num_pieces {
         let top_points = piece::Edge::gen_edge(
-            piece::Side::TOP,
             puzzle_dimensions.piece_width - puzzle_dimensions.piece_padding * 2,
             puzzle_dimensions.piece_padding,
         );
         let mut right_points = piece::Edge::gen_edge(
-            piece::Side::RIGHT,
             puzzle_dimensions.piece_height - puzzle_dimensions.piece_padding * 2,
             puzzle_dimensions.piece_padding,
         );
         let mut bottom_points = piece::Edge::gen_edge(
-            piece::Side::BOTTOM,
             puzzle_dimensions.piece_width - puzzle_dimensions.piece_padding * 2,
             puzzle_dimensions.piece_padding,
         );
         let mut left_points = piece::Edge::gen_edge(
-            piece::Side::LEFT,
             puzzle_dimensions.piece_height - puzzle_dimensions.piece_padding * 2,
             puzzle_dimensions.piece_padding,
         );
