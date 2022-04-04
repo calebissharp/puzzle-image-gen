@@ -2,16 +2,38 @@ mod piece;
 mod spline;
 mod util;
 
-use image::GenericImage;
+use bytemuck::{Pod, Zeroable};
 use image::{open, RgbaImage};
+use image::{EncodableLayout, GenericImage};
 use log::debug;
+use maligned::{align_first, aligned, Aligned, A256};
+use nalgebra::{
+    Matrix4, Orthographic3, Point3, Quaternion, Similarity2, Similarity3, Transform3,
+    UnitQuaternion, Vector2, Vector3, Vector4,
+};
 use piece::Puzzle;
 use rayon::prelude::*;
 use spline::CatmullRomSpline;
 use std::borrow::Cow;
+use std::f32;
+use std::mem;
 use std::time::Instant;
 use util::find_closest_multiple;
 use wgpu::util::DeviceExt;
+
+#[repr(C, align(256))]
+#[derive(Clone, Copy, Zeroable)]
+struct Locals {
+    position: [f32; 2],
+    tex_coords: [f32; 2],
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable, Pod)]
+struct Globals {
+    projection: [f32; 16], // 4x4 matrix
+}
 
 async fn run() {
     execute_gpu().await;
@@ -21,7 +43,7 @@ async fn execute_gpu() -> Option<()> {
     // Instantiates instance of WebGPU
     let instance = wgpu::Instance::new(wgpu::Backends::all());
 
-    let img = open("./test-images/uv.jpg").unwrap().to_rgba8();
+    let img = open("./test-images/chungus.jpg").unwrap().to_rgba8();
 
     // `request_adapter` instantiates the general connection to the GPU
     let adapter = instance
@@ -48,9 +70,23 @@ async fn execute_gpu() -> Option<()> {
     Some(())
 }
 
-async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaImage) -> Option<()> {
+async fn draw_masks(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut src_img: RgbaImage,
+) -> Option<()> {
     // let puzzle = Puzzle::new(3897, 3801, 16, 16);
-    let puzzle = Puzzle::new(1024, 1024, 16, 16);
+    let puzzle = Puzzle::new(src_img.width(), src_img.height(), 32, 32);
+
+    let mut img = RgbaImage::new(puzzle.dimensions.padded_width, puzzle.dimensions.height);
+    println!(
+        "Padding image for GPU, Original: ({}x{}), New: ({}x{})",
+        src_img.width(),
+        src_img.height(),
+        img.width(),
+        img.height(),
+    );
+    img.copy_from(&src_img, 0, 0).unwrap();
 
     let render_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
         label: None,
@@ -62,6 +98,7 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
     let mut buffer_sizes = vec![];
     let mut buffer_offsets = vec![];
     let mut all_tris = vec![];
+    let mut locals_data = Vec::<Locals>::with_capacity(puzzle.dimensions.num_pieces as usize);
 
     for x in 0..puzzle.dimensions.pieces_x {
         for y in 0..puzzle.dimensions.pieces_y {
@@ -72,26 +109,74 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
             let mut tris = vec![];
 
             for point in triangles {
-                tris.push(util::normalize_range(
-                    points[point * 2],
-                    0.,
-                    puzzle.dimensions.piece_width as f32
-                        + puzzle.dimensions.piece_padding as f32 * 2.,
-                    -1. + (2. / puzzle.dimensions.pieces_x as f32) * x as f32,
-                    -1. + (2. / puzzle.dimensions.pieces_x as f32) * (x as f32 + 1.),
-                ));
-                tris.push(util::normalize_range(
-                    points[point * 2 + 1],
-                    0.,
-                    puzzle.dimensions.piece_height as f32
-                        + puzzle.dimensions.piece_padding as f32 * 2.,
-                    -1. + (2. / puzzle.dimensions.pieces_y as f32) * y as f32,
-                    -1. + (2. / puzzle.dimensions.pieces_y as f32) * (y as f32 + 1.),
-                ));
+                // vertex coord
+                tris.push(points[point * 2]);
+                tris.push(points[point * 2 + 1]);
+
+                // texture coord
+                tris.push(
+                    util::normalize_range(
+                        points[point * 2],
+                        0.,
+                        puzzle.dimensions.piece_width as f32,
+                        0.,
+                        puzzle.dimensions.width as f32 / puzzle.dimensions.pieces_x as f32,
+                    ) + (puzzle.dimensions.width as f32 / puzzle.dimensions.pieces_x as f32)
+                        * x as f32
+                        - puzzle.dimensions.piece_padding as f32,
+                );
+                tris.push(
+                    util::normalize_range(
+                        points[point * 2 + 1],
+                        0.,
+                        puzzle.dimensions.piece_height as f32,
+                        0.,
+                        puzzle.dimensions.height as f32 / puzzle.dimensions.pieces_y as f32,
+                    ) + (puzzle.dimensions.height as f32 / puzzle.dimensions.pieces_y as f32)
+                        * y as f32
+                        - puzzle.dimensions.piece_padding as f32,
+                );
+                // tris.push(util::normalize_range(
+                //     points[point * 2],
+                //     0.,
+                //     (puzzle.dimensions.piece_width + puzzle.dimensions.piece_padding * 2) as f32,
+                //     -1.,
+                //     1.
+                //     // puzzle.dimensions.piece_width as f32
+                //     //     + puzzle.dimensions.piece_padding as f32 * 2.,
+                //     // -1. + (2. / puzzle.dimensions.pieces_x as f32) * x as f32,
+                //     // -1. + (2. / puzzle.dimensions.pieces_x as f32) * (x as f32 + 1.),
+                // ));
+                // tris.push(util::normalize_range(
+                //     points[point * 2 + 1],
+                //     0.,
+                //     (puzzle.dimensions.piece_height + puzzle.dimensions.piece_padding * 2) as f32,
+                //     -1.,
+                //     1.
+                //     // puzzle.dimensions.piece_height as f32
+                //     //     + puzzle.dimensions.piece_padding as f32 * 2.,
+                //     // -1. + (2. / puzzle.dimensions.pieces_y as f32) * y as f32,
+                //     // -1. + (2. / puzzle.dimensions.pieces_y as f32) * (y as f32 + 1.),
+                // ));
             }
 
             buffer_sizes.push(tris.len());
             buffer_offsets.push(all_tris.len());
+            locals_data.push(Locals {
+                position: [
+                    (x * puzzle.dimensions.piece_width + puzzle.dimensions.piece_padding * x * 2)
+                        as f32,
+                    (y * puzzle.dimensions.piece_height + puzzle.dimensions.piece_padding * y * 2)
+                        as f32,
+                ],
+                tex_coords: [
+                    (x * puzzle.dimensions.piece_width - puzzle.dimensions.piece_padding * 2 * x)
+                        as f32,
+                    (y * puzzle.dimensions.piece_height - puzzle.dimensions.piece_padding * 2 * y)
+                        as f32,
+                ],
+                _pad: 0,
+            });
 
             all_tris.append(&mut tris);
         }
@@ -122,6 +207,32 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
         depth_or_array_layers: 1,
     };
 
+    let puzzle_texture_extent = wgpu::Extent3d {
+        width: puzzle.dimensions.width,
+        height: puzzle.dimensions.height,
+        depth_or_array_layers: 1,
+    };
+    let puzzle_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        mip_level_count: 1,
+        sample_count: 1,
+        size: puzzle_texture_extent,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+    });
+    let puzzle_texture_view = puzzle_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let puzzle_texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
     let sample_count = 1;
 
     let mask_output_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -140,21 +251,6 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
     let mask_output_texture_view =
         mask_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let output_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Mask output texture"),
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        mip_level_count: 1,
-        sample_count: 1,
-        size: mask_output_size,
-        usage: wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::TEXTURE_BINDING,
-    });
-
-    let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
     let mask_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         mapped_at_creation: false,
@@ -162,57 +258,157 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
     });
 
-    let uniform_bind_group_layout =
+    let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment;
+    let padded_locals_data = unsafe {
+        std::slice::from_raw_parts(
+            locals_data.as_ptr() as *const u8,
+            locals_data.len() * uniform_alignment as usize,
+        )
+    };
+
+    // Buffer containg info like piece position and texture coordinates
+    let locals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Uniform Buffer"),
+        size: (puzzle.dimensions.num_pieces * uniform_alignment) as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    queue.write_buffer(&locals_buffer, 0, padded_locals_data);
+
+    let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: std::mem::size_of::<Globals>() as u64,
+        mapped_at_creation: false,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+    });
+
+    let proj = Orthographic3::<f32>::new(
+        0.,
+        (puzzle.dimensions.pieces_x * puzzle.dimensions.piece_width
+            + puzzle.dimensions.pieces_x * 2 * puzzle.dimensions.piece_padding) as f32,
+        (puzzle.dimensions.pieces_y * puzzle.dimensions.piece_height
+            + puzzle.dimensions.pieces_y * 2 * puzzle.dimensions.piece_padding) as f32,
+        0.,
+        10., // don't need z flipped, so put in opposite order
+        0.,
+    );
+
+    queue.write_buffer(
+        &globals_buffer,
+        0,
+        bytemuck::cast_slice(proj.as_matrix().as_slice()),
+    );
+
+    // Bind group layout with entries shared by all pieces
+    let global_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
-            //     wgpu::BindGroupLayoutEntry {
-            //     binding: 0,
-            //     visibility: wgpu::ShaderStages::VERTEX,
-            //     count: None,
-            //     ty: wgpu::BindingType::Buffer {
-            //         ty: wgpu::BufferBindingType::Uniform,
-            //         has_dynamic_offset: false,
-            //         min_binding_size: None,
-            //     },
-            // }
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
+        });
+
+    // Bind group layout with entries specific to each piece
+    let local_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
         });
 
     let render_mask_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render masks pipeline layout"),
-            bind_group_layouts: &[
-                // &uniform_bind_group_layout
-            ],
+            bind_group_layouts: &[&global_bind_group_layout, &local_bind_group_layout],
             push_constant_ranges: &[],
         });
 
-    // let mask_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-    //     label: None,
-    //     layout: &uniform_bind_group_layout,
-    //     entries: &[wgpu::BindGroupEntry {
-    //         binding: 0,
-    //         resource: buffers[0].as_entire_binding(),
-    //     }],
-    // });
+    let global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &global_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&puzzle_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&puzzle_texture_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: globals_buffer.as_entire_binding(),
+            },
+        ],
+    });
 
-    // img.save("something.png").unwrap();
+    let local_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &local_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &locals_buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(mem::size_of::<Locals>() as _),
+            }),
+        }],
+    });
 
     let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("Mask render pipeline"),
-        // layout: Some(&render_mask_pipeline_layout),
-        layout: None,
+        layout: Some(&render_mask_pipeline_layout),
         vertex: wgpu::VertexState {
             module: &render_shader,
             entry_point: "vs_main",
             buffers: &[wgpu::VertexBufferLayout {
-                array_stride: 8,
-                attributes: &[wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x2,
-                    offset: 0,
-                    shader_location: 0,
-                }],
+                array_stride: 16,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 4 * 2,
+                        shader_location: 1,
+                    },
+                ],
                 step_mode: wgpu::VertexStepMode::Vertex,
             }],
         },
@@ -239,6 +435,17 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
         multiview: None,
     });
 
+    queue.write_texture(
+        puzzle_texture.as_image_copy(),
+        &img,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: std::num::NonZeroU32::new(4 * puzzle.dimensions.padded_width),
+            rows_per_image: std::num::NonZeroU32::new(puzzle.dimensions.height),
+        },
+        puzzle_texture_extent,
+    );
+
     // A command encoder executes one or many pipelines.
     // It is to WebGPU what a command buffer is to Vulkan.
     let mut encoder =
@@ -264,12 +471,16 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
             depth_stencil_attachment: None,
         });
         rpass.set_pipeline(&render_pipeline);
+        rpass.set_bind_group(0, &global_bind_group, &[]);
         // let points_per_piece = vertices.len() as u32 / puzzle_dimensions.num_pieces;
         // for i in 0..puzzle.dimensions.num_pieces {
         // let offset = (i as wgpu::DynamicOffset) * (uniform_alignment as wgpu::DynamicOffset);
         // rpass.set_bind_group(0, &mask_bind_group, &[]);
         for i in 0..(puzzle.dimensions.num_pieces as usize) {
             // let i = 31;
+            let offset = (i as wgpu::DynamicOffset) * (uniform_alignment as wgpu::DynamicOffset);
+            // rpass.set_bind_group(1, &local_bind_group, &[offset]);
+            rpass.set_bind_group(1, &local_bind_group, &[offset]);
             let buffer_size = buffer_sizes[i] as u64;
             // let slice = buffer.slice(..);
             let slice = buffer.slice(
@@ -279,7 +490,7 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
 
             rpass.set_vertex_buffer(0, slice);
             rpass.draw(
-                0..(buffer_size / 2) as u32,
+                0..(buffer_size / 4) as u32,
                 // 0..100,
                 0..1,
             );
@@ -332,7 +543,7 @@ async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, mut img: RgbaIma
         )
         .unwrap();
 
-        let path = format!("mask.png",);
+        let path = format!("test-image.png",);
         image.save(path).unwrap();
 
         println!(

@@ -3,13 +3,13 @@ edition = "2021"
 name = "puzzle-image-gen"
 version = "0.1.0"
 [dependencies]
-bytemuck = "1.8.0"
 delaunator = "1.0.1"
 earcutr = "0.2.0"
 env_logger = "0.9.0"
 humantime = "2.1.0"
 image = "0.24.1"
 log = "0.4.16"
+maligned = "0.2.1"
 nalgebra = "0.30.1"
 ndarray = "0.15.4"
 num = "0.4.0"
@@ -17,6 +17,11 @@ pollster = "0.2.5"
 rand = "0.8.5"
 rayon = "1.5.1"
 splines = "4.0.3"
+transform-matrix = "0.1.1"
+
+[dependencies.bytemuck]
+features = ["derive"]
+version = "1.9.1"
 
 [dependencies.clap]
 features = ["derive"]
