@@ -3,10 +3,7 @@ use std::f64::consts::PI;
 
 use crate::{spline::CatmullRomSpline, util::find_closest_multiple};
 
-pub const MAX_JOINER_SIZE: u32 = 16;
-
 pub enum Side {
-    TOP,
     LEFT,
     BOTTOM,
     RIGHT,
@@ -41,18 +38,6 @@ fn reflect_point_vertical(point: &mut [f64; 2], y: f64) {
 fn reflect_points_vertical(points: &mut Vec<[f64; 2]>, y: f64) {
     for point in points.iter_mut() {
         reflect_point_vertical(point, y);
-    }
-}
-
-fn reflect_point_horizontal(point: &mut [f64; 2], orig_x: f64) {
-    point[0] -= orig_x;
-    point[0] *= -1.;
-    point[0] += orig_x;
-}
-
-fn reflect_points_horizontal(points: &mut Vec<[f64; 2]>, x: f64) {
-    for point in points.iter_mut() {
-        reflect_point_horizontal(point, x);
     }
 }
 
@@ -125,14 +110,12 @@ impl Edge {
         let half = self.side_length as f64 / 2.;
 
         let angle = match side {
-            Side::TOP => 0.,
             Side::RIGHT => PI / 2.,
             Side::BOTTOM => PI,
             Side::LEFT => PI * 1.5,
         };
 
         let invert = match side {
-            Side::TOP => false,
             Side::RIGHT => false,
             Side::BOTTOM => true,
             Side::LEFT => true,
@@ -260,22 +243,15 @@ impl Puzzle {
         Puzzle { dimensions, edges }
     }
 
-    fn xy_to_index(&self, x: u32, y: u32) -> usize {
-        (x + y * self.dimensions.pieces_x) as usize
-    }
-
     pub fn top_edge(&self, x: u32, y: u32) -> &Edge {
-        let i = self.xy_to_index(x, y);
         &self.edges[(y * self.dimensions.pieces_x + x) as usize]
     }
 
     pub fn bottom_edge(&self, x: u32, y: u32) -> &Edge {
-        let i = self.xy_to_index(x, y);
         &self.edges[(y * self.dimensions.pieces_x + x + self.dimensions.pieces_x) as usize]
     }
 
     pub fn left_edge(&self, x: u32, y: u32) -> &Edge {
-        let i = self.xy_to_index(x, y);
         &self.edges[(self.dimensions.num_pieces
             + self.dimensions.pieces_x
             + self.dimensions.pieces_y * x
@@ -283,7 +259,6 @@ impl Puzzle {
     }
 
     pub fn right_edge(&self, x: u32, y: u32) -> &Edge {
-        let i = self.xy_to_index(x, y);
         &self.edges[(self.dimensions.num_pieces
             + self.dimensions.pieces_x
             + self.dimensions.pieces_y * x

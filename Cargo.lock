@@ -764,12 +764,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "maligned"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e88c3cbe8288f77f293e48a28b3232e3defd203a6d839fa7f68ea4329e83464"
-
-[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1163,7 +1157,6 @@ dependencies = [
  "image",
  "imageproc",
  "log",
- "maligned",
  "nalgebra",
  "ndarray",
  "num",
@@ -1171,7 +1164,6 @@ dependencies = [
  "rand 0.8.5",
  "rayon",
  "splines",
- "transform-matrix",
  "wgpu",
 ]
 
@@ -1540,12 +1532,6 @@ dependencies = [
  "jpeg-decoder 0.1.22",
  "weezl",
 ]
-
-[[package]]
-name = "transform-matrix"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5ca75166e204111bb4a67bc16ca908268c15042b6513d33667b505428f32460"
 
 [[package]]
 name = "ttf-parser"
