@@ -1,9 +1,30 @@
+mod piece;
+mod spline;
+mod util;
+
+use bytemuck::{Pod, Zeroable};
 use image::GenericImage;
 use image::{open, RgbaImage};
+use nalgebra::Orthographic3;
+use piece::Puzzle;
 use std::borrow::Cow;
+use std::f32;
+use std::mem;
+use std::time::Instant;
+use wgpu::util::DeviceExt;
 
-fn find_closest_multiple(n: u32, x: u32) -> u32 {
-    ((n - 1) | (x - 1)) + 1
+#[repr(C, align(256))]
+#[derive(Clone, Copy, Zeroable)]
+struct Locals {
+    position: [f32; 2],
+    tex_coords: [f32; 2],
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable, Pod)]
+struct Globals {
+    projection: [f32; 16], // 4x4 matrix
 }
 
 async fn run() {
@@ -27,7 +48,7 @@ async fn execute_gpu() -> Option<()> {
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                features: wgpu::Features::empty(),
+                features: wgpu::Features::POLYGON_MODE_LINE,
                 limits: wgpu::Limits::default(),
             },
             None,
@@ -35,63 +56,138 @@ async fn execute_gpu() -> Option<()> {
         .await
         .unwrap();
 
-    execute_gpu_inner(&device, &queue, img).await;
+    draw_masks(&device, &queue, img).await;
 
     Some(())
 }
 
-async fn execute_gpu_inner(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    src_img: RgbaImage,
-) -> Option<()> {
-    let original_image_dimensions = src_img.dimensions();
-    let mut image = RgbaImage::new(
-        find_closest_multiple(src_img.width(), 256),
-        src_img.height(),
-    );
+async fn draw_masks(device: &wgpu::Device, queue: &wgpu::Queue, src_img: RgbaImage) -> Option<()> {
+    let puzzle = Puzzle::new(src_img.width(), src_img.height(), 32, 32);
+
+    let mut img = RgbaImage::new(puzzle.dimensions.padded_width, puzzle.dimensions.height);
     println!(
-        "Original: ({}x{}), New: ({}x{})",
+        "Padding image for GPU, Original: ({}x{}), New: ({}x{})",
         src_img.width(),
         src_img.height(),
-        image.width(),
-        image.height(),
+        img.width(),
+        img.height(),
     );
-    image.copy_from(&src_img, 0, 0).unwrap();
+    img.copy_from(&src_img, 0, 0).unwrap();
 
-    // Loads the shader from WGSL
-    let cs_module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+    let render_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
         label: None,
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("cookie-cutter.wgsl"))),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("./gen-masks.wgsl"))),
     });
 
-    let dimensions = image.dimensions();
+    let generate_start = Instant::now();
+
+    let mut buffer_sizes = vec![];
+    let mut buffer_offsets = vec![];
+    let mut all_tris = vec![];
+    let mut locals_data = Vec::<Locals>::with_capacity(puzzle.dimensions.num_pieces as usize);
+
+    for x in 0..puzzle.dimensions.pieces_x {
+        for y in 0..puzzle.dimensions.pieces_y {
+            let points = puzzle.get_piece_points(x, y);
+
+            let triangles = earcutr::earcut(&points, &vec![], 2);
+
+            let mut tris = vec![];
+
+            for point in triangles {
+                // vertex coord
+                tris.push(points[point * 2]);
+                tris.push(points[point * 2 + 1]);
+
+                // texture coord
+                tris.push(
+                    util::normalize_range(
+                        points[point * 2],
+                        0.,
+                        puzzle.dimensions.piece_width as f32,
+                        0.,
+                        puzzle.dimensions.width as f32 / puzzle.dimensions.pieces_x as f32,
+                    ) + (puzzle.dimensions.width as f32 / puzzle.dimensions.pieces_x as f32)
+                        * x as f32
+                        - puzzle.dimensions.piece_padding as f32,
+                );
+                tris.push(
+                    util::normalize_range(
+                        points[point * 2 + 1],
+                        0.,
+                        puzzle.dimensions.piece_height as f32,
+                        0.,
+                        puzzle.dimensions.height as f32 / puzzle.dimensions.pieces_y as f32,
+                    ) + (puzzle.dimensions.height as f32 / puzzle.dimensions.pieces_y as f32)
+                        * y as f32
+                        - puzzle.dimensions.piece_padding as f32,
+                );
+            }
+
+            buffer_sizes.push(tris.len());
+            buffer_offsets.push(all_tris.len());
+            locals_data.push(Locals {
+                position: [
+                    (x * puzzle.dimensions.piece_width + puzzle.dimensions.piece_padding * x * 2)
+                        as f32,
+                    (y * puzzle.dimensions.piece_height + puzzle.dimensions.piece_padding * y * 2)
+                        as f32,
+                ],
+                tex_coords: [
+                    (x * puzzle.dimensions.piece_width - puzzle.dimensions.piece_padding * 2 * x)
+                        as f32,
+                    (y * puzzle.dimensions.piece_height - puzzle.dimensions.piece_padding * 2 * y)
+                        as f32,
+                ],
+                _pad: 0,
+            });
+
+            all_tris.append(&mut tris);
+        }
+    }
 
     println!(
-        "Max texture size: {}",
-        device.limits().max_texture_dimension_2d
+        "Generated {} tris in {}ms",
+        all_tris.len() / 3,
+        generate_start.elapsed().as_millis()
     );
 
-    let texture_extent = wgpu::Extent3d {
-        width: dimensions.0,
-        height: dimensions.1,
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        contents: &bytemuck::cast_slice(&all_tris),
+        label: None,
+        usage: wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::UNIFORM,
+    });
+
+    let mask_output_size = wgpu::Extent3d {
+        width: util::find_closest_multiple(
+            (puzzle.dimensions.padded_piece_width + puzzle.dimensions.piece_padding * 2)
+                * puzzle.dimensions.pieces_x,
+            wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+        ),
+        height: (puzzle.dimensions.piece_height + puzzle.dimensions.piece_padding * 2)
+            * puzzle.dimensions.pieces_y,
         depth_or_array_layers: 1,
     };
 
-    let src_texture = device.create_texture(&wgpu::TextureDescriptor {
-        size: texture_extent,
-        mip_level_count: 1,
-        sample_count: 1,
+    let puzzle_texture_extent = wgpu::Extent3d {
+        width: puzzle.dimensions.width,
+        height: puzzle.dimensions.height,
+        depth_or_array_layers: 1,
+    };
+    let puzzle_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::COPY_DST,
-        label: Some("piece-texture"),
+        mip_level_count: 1,
+        sample_count: 1,
+        size: puzzle_texture_extent,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
     });
-    let src_texture_view = src_texture.create_view(&Default::default());
-    let src_texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+    let puzzle_texture_view = puzzle_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let puzzle_texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
         address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -101,26 +197,81 @@ async fn execute_gpu_inner(
         ..Default::default()
     });
 
-    let output_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: texture_extent,
-        mip_level_count: 1,
-        sample_count: 1,
+    let sample_count = 1;
+
+    let mask_output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Mask output texture"),
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::STORAGE_BINDING,
+        mip_level_count: 1,
+        sample_count,
+        size: mask_output_size,
+        usage: wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING,
     });
-    let output_texture_view = output_texture.create_view(&Default::default());
 
-    let texture_bind_group_layout =
+    let mask_output_texture_view =
+        mask_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mask_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        mapped_at_creation: false,
+        size: (mask_output_size.width * mask_output_size.height * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment;
+    let padded_locals_data = unsafe {
+        std::slice::from_raw_parts(
+            locals_data.as_ptr() as *const u8,
+            locals_data.len() * uniform_alignment as usize,
+        )
+    };
+
+    // Buffer containg info like piece position and texture coordinates
+    let locals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Uniform Buffer"),
+        size: (puzzle.dimensions.num_pieces * uniform_alignment) as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    queue.write_buffer(&locals_buffer, 0, padded_locals_data);
+
+    let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: std::mem::size_of::<Globals>() as u64,
+        mapped_at_creation: false,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+    });
+
+    let proj = Orthographic3::<f32>::new(
+        0.,
+        (puzzle.dimensions.pieces_x * puzzle.dimensions.piece_width
+            + puzzle.dimensions.pieces_x * 2 * puzzle.dimensions.piece_padding) as f32,
+        (puzzle.dimensions.pieces_y * puzzle.dimensions.piece_height
+            + puzzle.dimensions.pieces_y * 2 * puzzle.dimensions.piece_padding) as f32,
+        0.,
+        10., // don't need z flipped, so put in opposite order
+        0.,
+    );
+
+    queue.write_buffer(
+        &globals_buffer,
+        0,
+        bytemuck::cast_slice(proj.as_matrix().as_slice()),
+    );
+
+    // Bind group layout with entries shared by all pieces
+    let global_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         multisampled: false,
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -130,140 +281,227 @@ async fn execute_gpu_inner(
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
             ],
-            label: Some("texture_bind_group_layout"),
         });
 
-    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    // Bind group layout with entries specific to each piece
+    let local_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+    let render_mask_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render masks pipeline layout"),
+            bind_group_layouts: &[&global_bind_group_layout, &local_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+    let global_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        mapped_at_creation: false,
-        size: (dimensions.0 * dimensions.1 * 4) as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-    });
-
-    // A pipeline specifies the operation of a shader
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None,
-        bind_group_layouts: &[&texture_bind_group_layout],
-        push_constant_ranges: &[],
-    });
-
-    // Instantiates the pipeline.
-    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None,
-        layout: Some(&pipeline_layout),
-        module: &cs_module,
-        entry_point: "main",
-    });
-
-    // Instantiates the bind group, once again specifying the binding of buffers.
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("src bind group"),
-        layout: &texture_bind_group_layout,
+        layout: &global_bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&src_texture_view),
+                resource: wgpu::BindingResource::TextureView(&puzzle_texture_view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::Sampler(&src_texture_sampler),
+                resource: wgpu::BindingResource::Sampler(&puzzle_texture_sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::TextureView(&output_texture_view),
+                resource: globals_buffer.as_entire_binding(),
             },
         ],
     });
 
-    println!("bytes_per_row: {}", dimensions.0);
+    let local_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &local_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &locals_buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(mem::size_of::<Locals>() as _),
+            }),
+        }],
+    });
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Mask render pipeline"),
+        layout: Some(&render_mask_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &render_shader,
+            entry_point: "vs_main",
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: 16,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 4 * 2,
+                        shader_location: 1,
+                    },
+                ],
+                step_mode: wgpu::VertexStepMode::Vertex,
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &render_shader,
+            entry_point: "fs_main",
+            targets: &[wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::default(),
+            }],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            ..wgpu::PrimitiveState::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview: None,
+    });
 
     queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: &src_texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &image,
+        puzzle_texture.as_image_copy(),
+        &img,
         wgpu::ImageDataLayout {
             offset: 0,
-            bytes_per_row: std::num::NonZeroU32::new(4 * dimensions.0),
-            rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+            bytes_per_row: std::num::NonZeroU32::new(4 * puzzle.dimensions.padded_width),
+            rows_per_image: std::num::NonZeroU32::new(puzzle.dimensions.height),
         },
-        texture_extent,
+        puzzle_texture_extent,
     );
 
     // A command encoder executes one or many pipelines.
     // It is to WebGPU what a command buffer is to Vulkan.
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
     {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        cpass.set_pipeline(&compute_pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch(dimensions.0, dimensions.1, 1);
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[wgpu::RenderPassColorAttachment {
+                view: &mask_output_texture_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
+                    store: true,
+                },
+            }],
+            depth_stencil_attachment: None,
+        });
+        rpass.set_pipeline(&render_pipeline);
+        rpass.set_bind_group(0, &global_bind_group, &[]);
+        for i in 0..(puzzle.dimensions.num_pieces as usize) {
+            let offset = (i as wgpu::DynamicOffset) * (uniform_alignment as wgpu::DynamicOffset);
+            rpass.set_bind_group(1, &local_bind_group, &[offset]);
+
+            let buffer_size = buffer_sizes[i] as u64;
+            let slice = buffer.slice(
+                (buffer_offsets[i] as u64 * 4)
+                    ..(buffer_offsets[i] as u64 * 4 + buffer_size * 4 as u64),
+            );
+
+            rpass.set_vertex_buffer(0, slice);
+            rpass.draw(0..(buffer_size / 4) as u32, 0..1);
+        }
     }
-    // Sets adds copy operation to command encoder.
-    // Will copy data from storage buffer on GPU to staging buffer on CPU.
+
     encoder.copy_texture_to_buffer(
-        output_texture.as_image_copy(),
+        mask_output_texture.as_image_copy(),
         wgpu::ImageCopyBuffer {
-            buffer: &staging_buffer,
+            buffer: &mask_staging_buffer,
             layout: wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: std::num::NonZeroU32::new(4 * dimensions.0),
-                rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+                bytes_per_row: std::num::NonZeroU32::new(mask_output_size.width * 4),
+                rows_per_image: std::num::NonZeroU32::new(mask_output_size.height),
             },
         },
-        texture_extent,
+        mask_output_size,
     );
+
+    let render_start = Instant::now();
 
     // Submits command encoder for processing
     queue.submit(Some(encoder.finish()));
 
-    let slice = staging_buffer.slice(..);
-    let buffer_future = slice.map_async(wgpu::MapMode::Read);
+    let render_slice = mask_staging_buffer.slice(..);
+    let render_buffer_future = render_slice.map_async(wgpu::MapMode::Read);
 
     // Poll the device in a blocking manner so that our future resolves.
     // In an actual application, `device.poll(...)` should
     // be called in an event loop or on another thread.
     device.poll(wgpu::Maintain::Wait);
 
-    if let Ok(()) = buffer_future.await {
-        let data = slice.get_mapped_range();
-        let result: Vec<u8> = bytemuck::cast_slice(&data).to_vec();
+    println!(
+        "Took {}ms to render {} pieces",
+        render_start.elapsed().as_millis(),
+        puzzle.dimensions.num_pieces
+    );
 
-        // assert_eq!(&result, image.as_raw());
+    if let Ok(()) = render_buffer_future.await {
+        let data = render_slice.get_mapped_range();
+        let result: &[u8] = bytemuck::cast_slice(&data);
 
-        let mut new_image = image::RgbaImage::from_raw(dimensions.0, dimensions.1, result).unwrap();
-
-        let cropped_image = image::imageops::crop(
-            &mut new_image,
-            0,
-            0,
-            original_image_dimensions.0,
-            original_image_dimensions.1,
+        let saving_start = Instant::now();
+        println!("Saving images...");
+        let image = image::RgbaImage::from_raw(
+            mask_output_size.width,
+            mask_output_size.height,
+            result.to_vec(),
         )
-        .to_image();
+        .unwrap();
 
-        println!("Saving image...");
-        cropped_image.save("test-image.png").unwrap();
+        let path = format!("test-image.png",);
+        image.save(path).unwrap();
+
+        println!(
+            "Took {}ms to save images",
+            saving_start.elapsed().as_millis()
+        );
     } else {
         panic!("AHHH")
     }
@@ -272,6 +510,7 @@ async fn execute_gpu_inner(
 }
 
 fn main() {
+    let start = Instant::now();
     #[cfg(not(target_arch = "wasm32"))]
     {
         env_logger::init();
@@ -283,4 +522,6 @@ fn main() {
         console_log::init().expect("could not initialize logger");
         wasm_bindgen_futures::spawn_local(run());
     }
+
+    println!("\nFinished in {}ms.", start.elapsed().as_millis());
 }
