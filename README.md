@@ -2,14 +2,10 @@
 
 Generates jigsaw puzzle pieces from an input image.
 
-<div style="display: flex; justify-content: space-between; align-items: center">
-
+<div align="center">
 <img width="40%" src="./test-images//uv.jpg" alt="input image" />
-
-<div style="font-size: 2em">➡️</div>
-
+<div>⬇️</div>
 <img width="40%" src="./docs/example-output.png" alt="output image" />
-
 </div>
 
 ## Getting started
