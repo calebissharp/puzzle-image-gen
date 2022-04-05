@@ -23,7 +23,7 @@ version = "1.9.1"
 
 [dependencies.clap]
 features = ["derive"]
-version = "3.1.6"
+version = "3.1.8"
 
 [dependencies.imageproc]
 git = "https://github.com/image-rs/imageproc"

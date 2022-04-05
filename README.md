@@ -15,5 +15,5 @@ Generates jigsaw puzzle pieces from an input image.
 ## Getting started
 
 ```bash
-cargo run --release
+cargo run --release -- -i test-images/chungus.jpg -x 32 -y 32 -o output.png
 ```
